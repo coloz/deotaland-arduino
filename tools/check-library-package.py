@@ -57,8 +57,15 @@ def check(package, library):
         "examples/CameraSnapshot/CameraCapture.cpp", "examples/CameraSnapshot/camera_pins.h",
         "examples/StoredJpegUpload/sample_jpeg.h", "examples/ImageSequence/ImageSequence.ino",
         "examples/CoCDiagnostics/CoCDiagnostics.ino", "examples/CoCOtaUpdate/CoCOtaUpdate.ino",
+        "examples/AiotBasicAgent/AiotBasicAgent.ino", "examples/AiotBasicAgent/BoardRecording.cpp",
+        "examples/BasicBLE/BasicBLE.ino", "examples/VoicePTT/VoicePTT.ino",
+        "examples/RealtimeASR/RealtimeASR.ino", "examples/BufferedPlayback/BufferedPlayback.ino",
     )
     require(all(name in relative for name in ROOT_FILES + required), "Missing delivery files")
+    require(not any(re.match(r"src/(?:wifi_|cloud_|transport_wifi\.|portable_backends\.|worker_wake\.)",
+                             name, re.IGNORECASE) for name in relative), "Removed network backend in ZIP")
+    require(not any(re.match(r"examples/(?:BasicWiFi|WiFiProvisioning|CloudActivation|WiFiMqttControl)/",
+                             name, re.IGNORECASE) for name in relative), "Removed network example in ZIP")
     expected = source_files(library)
     require(set(relative) == set(expected), "File list differs from checkout: " + repr(sorted(set(relative) ^ set(expected))))
     for name, content in expected.items():

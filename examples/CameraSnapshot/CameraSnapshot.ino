@@ -217,7 +217,6 @@ void setup() {
   cameraEndpoint.value = AGENT_VAL_BOOL;
   cameraEndpoint.desc = "Set true to capture a fresh camera image and upload JPEG to the app";
   cameraEndpoint.display_name = "Camera Snapshot";
-  cameraEndpoint.args_schema = "{\"type\":\"boolean\"}";
   beginError = Deotaland.registerIo(cameraEndpoint, actuate);
   if (beginError == ESP_OK)
     beginError = Deotaland.begin("Deotaland-Camera", AGENT_CAP_CAMERA, nullptr, onState);

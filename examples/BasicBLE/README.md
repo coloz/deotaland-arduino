@@ -10,6 +10,8 @@
 
 板型、分区和 USB 串口设置见[入门指南](../../docs/BEGINNER-GUIDE.zh-CN.md)。
 
+应用分区须容纳最终 BLE 固件；启用 OTA 时选择实际 Flash 容量支持的双应用槽。可使用 `PartitionScheme=min_spiffs`，其他容量按最终编译输出选择，勿只改变 Flash 菜单而忽略实际容量。
+
 ## 使用步骤
 
 1. 打开 [BasicBLE.ino](BasicBLE.ino)，按实际开发板选择板型、端口及足够大的应用分区，编译上传。

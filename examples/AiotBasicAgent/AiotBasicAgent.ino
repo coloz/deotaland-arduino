@@ -1,4 +1,4 @@
-/* Complete AIOT-Basic application: real PDM mic/I2S audio, camera JPEG, ST7789,
+/* Complete AIOT-Basic application: real microphone/I2S audio, camera JPEG, ST7789,
  * WS2812, BLE VOICE/AUDIO/TTS/IMAGE, I/O, prompts and optional App OTA.
  * Read README.md before selecting USB, PSRAM and partition options.
  * Serial: p/r=PTT, a/s=App audio capture/stop, c=photo upload, t=prompt,
@@ -8,9 +8,13 @@
  */
 #include <Arduino.h>
 #include <Deotaland.h>
+#include <agent_link_transport.h>
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
 #include <esp_heap_caps.h>
+#include <cmath>
+#include <cstdarg>
+#include <cstdio>
 #include "BoardConfig.h"
 #include "BoardAudio.h"
 #include "BoardDisplay.h"
@@ -49,13 +53,27 @@ bool textHold = false, captureEnabled = false, recordingRequested = false;
 bool recordingOwned = false;
 uint8_t volume = AIOT_INITIAL_VOLUME;
 uint32_t ledRgb = 0x000010, epoch = 0, photoEpoch = 0, photoAt = 0, cameraAt = 0;
-uint32_t lastPreview = 0, lastDiagnostic = 0, lastPrompt = 0, lastReading = 0;
+uint32_t lastPreview = 0, lastDiagnostic = 0, lastPrompt = 0;
+#if AIOT_UPTIME_REPORT_INTERVAL_MS > 0
+uint32_t lastReading = 0;
+#endif
 uint32_t buttonAt = 0, listenAt = 0, listenLimit = 0, lastOpen = 0, lastClose = 0;
 uint32_t captureStarted = 0, droppedFrames = 0, uploadedImages = 0;
+uint32_t captureDriverDrops = 0, pendingTimeoutDrops = 0;
+uint32_t pendingReplacementDrops = 0, cancelPendingDrops = 0;
 uint32_t lastText = 0, recordingStarted = 0;
 uint64_t capturedBytes = 0, playedBytes = 0;
-char textLog[513] = {};
+// Inspect actual captured PCM; successful DMA alone cannot prove a mic signal.
+uint64_t micSamples = 0, micSquares = 0, micChanges = 0, micClipped = 0;
+int64_t micSum = 0;
+int16_t micMinimum = 32767, micMaximum = -32768, micPrevious = 0;
+char textLog[515] = {}; // 512 text bytes plus CRLF and terminator.
 size_t textLogOffset = 0, textLogLength = 0;
+constexpr size_t kDiagnosticBytes = 4096;
+char* diagnosticLog = nullptr; // Once allocated: PSRAM first, internal fallback.
+size_t diagnosticLogOffset = 0, diagnosticLogLength = 0;
+uint32_t diagnosticAllocateAt = 0;
+bool diagnosticAllocationFailed = false;
 
 enum class MicPhase { Idle, Open, Closing, Draining };
 MicPhase micPhase = MicPhase::Idle;
@@ -79,12 +97,23 @@ bool fileComplete = true;
 
 bool retryable(esp_err_t error) { return Deotaland.isRetryable(error); }
 void report(const char* operation, esp_err_t error) {
-  if (Serial) Serial.printf("%s: %s\n", operation, Deotaland.errorName(error));
+  if (!Serial) return;
+  char line[192];
+  const int count = std::snprintf(line, sizeof(line), "%s: %s\r\n", operation,
+                                  Deotaland.errorName(error));
+  // Short logs are optional: never wait for a monitor to consume them.
+  if (count > 0 && size_t(count) < sizeof(line) && Serial.availableForWrite() >= count)
+    Serial.write(reinterpret_cast<const uint8_t*>(line), size_t(count));
+}
+void discardPendingMic() {
+  if (pcmLength > pcmOffset) ++cancelPendingDrops;
+  pcmLength = pcmOffset = 0;
 }
 void consumeCaptureDrops() {
   const uint32_t lost = audio.takeCaptureDrops();
   if (!lost) return;
   droppedFrames += lost;
+  captureDriverDrops += lost;
   if (micPhase == MicPhase::Open || micPhase == MicPhase::Closing) micComplete = false;
   if (recordingOwned && fileMode == FileMode::None && recordings.busy()) {
     recordings.stopRecording(false);
@@ -121,8 +150,9 @@ void onText(const char* utf8, void*) {
   textHold = true;
   lastText = millis();
   // Preserve UTF-8 for Serial; LCD's built-in font has ASCII glyphs only.
-  textLogLength = utf8 ? strnlen(utf8, sizeof(textLog) - 1) : 0;
+  textLogLength = utf8 ? strnlen(utf8, sizeof(textLog) - 3) : 0;
   if (textLogLength) memcpy(textLog, utf8, textLogLength);
+  if (textLogLength) { textLog[textLogLength++] = '\r'; textLog[textLogLength++] = '\n'; }
   textLog[textLogLength] = '\0';
   textLogOffset = 0;
 }
@@ -161,10 +191,7 @@ void onState(agent_state_t state, void*) {
 }
 void onStatus(const agent_link_status_t* status, void*) {
   if (!status) return;
-  char hint[128];
-  if (status->code[0]) snprintf(hint, sizeof(hint), "%s  Code: %s", status->hint, status->code);
-  else snprintf(hint, sizeof(hint), "%s", status->hint);
-  screen.showStatus(status->title, hint);
+  screen.showStatus(status->title, status->hint);
 }
 void onOta(const agent_ota_status_t* status, void*) {
   char hint[80];
@@ -192,6 +219,10 @@ bool onCommand(uint16_t command, const uint8_t* payload, size_t length,
 
 void setCapture(bool enabled) {
   if (enabled != captureEnabled) {
+    if (enabled) {
+      micSamples = micSquares = micChanges = micClipped = 0; micSum = 0;
+      micMinimum = 32767; micMaximum = -32768; micPrevious = 0;
+    }
     audio.setCapture(enabled);
     captureEnabled = enabled;
   }
@@ -221,7 +252,7 @@ void cancelMedia() {
   recordingRequested = false;
   recordings.stopRecording(false);
   stopFile();
-  pcmLength = pcmOffset = 0;
+  discardPendingMic();
   upload.cancel();
   if (camera.busy()) captureExpired = true;
   const bool replyQueued = started && Deotaland.playbackActive();
@@ -240,7 +271,7 @@ void resetMedia() {
   if (fileMode != FileMode::Play) audio.cancelPlayback();
   micPhase = MicPhase::Idle;
   micHandle = nullptr;
-  pcmLength = pcmOffset = 0;
+  discardPendingMic();
   micFault = false;
   discardReply = false;
   if (fileMode == FileMode::Upload) {
@@ -258,11 +289,11 @@ void pollMic(uint32_t now) {
     buttonMustRelease = true;
   }
   const bool wanted = (listenRequested || pttRequested) && Deotaland.isReady() &&
-                      audio.ready() && fileMode == FileMode::None && !agent_link_ota_is_busy() &&
+                      audio.captureReady() && fileMode == FileMode::None && !agent_link_ota_is_busy() &&
                       !agent_link_ota_needs_reconnect();
   const agent_stream_t desired = listenRequested ? AGENT_STREAM_AUDIO : AGENT_STREAM_VOICE;
   if (micPhase == MicPhase::Open && (!wanted || desired != micKind))
-    stopMic(audio.ready() && Deotaland.isReady() && !agent_link_ota_is_busy());
+    stopMic(audio.captureReady() && Deotaland.isReady() && !agent_link_ota_is_busy());
 
   if (micPhase == MicPhase::Idle && wanted && !micFault && audioError == ESP_OK &&
       uint32_t(now - lastOpen) >= 100) {
@@ -289,6 +320,7 @@ void pollMic(uint32_t now) {
       pcmLength = pcmOffset = 0;
       micComplete = false;
       ++droppedFrames;
+      ++pendingTimeoutDrops;
     }
     if (pcmLength) {
       const size_t bytes = min(size_t(512), pcmLength - pcmOffset);
@@ -298,7 +330,7 @@ void pollMic(uint32_t now) {
         capturedBytes += bytes;
         if (pcmOffset == pcmLength) pcmLength = pcmOffset = 0;
       } else if (!retryable(error)) {
-        pcmLength = pcmOffset = 0;
+        discardPendingMic();
         pttRequested = listenRequested = false;
         stopMic(false);
         report("mic write", error);
@@ -321,7 +353,7 @@ void pollMic(uint32_t now) {
     micHandle = nullptr;
     micFault = true;
     pttRequested = listenRequested = false;
-    pcmLength = pcmOffset = 0;
+    discardPendingMic();
     report("mic END stalled; reconnect before another stream", ESP_ERR_TIMEOUT);
   }
   if (micPhase == MicPhase::Draining) {
@@ -339,12 +371,12 @@ void pollRecording(uint32_t now) {
   recordings.poll();
   consumeCaptureDrops();
   if (recordingOwned && !recordings.busy()) recordingOwned = false;
-  if (recordings.recording() && !audio.ready()) {
+  if (recordings.recording() && !audio.captureReady()) {
     recordings.stopRecording(false);
     report("audio driver failed during SD recording", ESP_FAIL);
   }
   if (recordingRequested && !recordings.recording() && !recordings.busy() &&
-      fileMode == FileMode::None && !agent_link_ota_is_busy() && audio.ready()) {
+      fileMode == FileMode::None && !agent_link_ota_is_busy() && audio.captureReady()) {
     recordingRequested = false; // One attempt; do not retry failed SD writes indefinitely.
     const esp_err_t error = recordings.startRecording();
     if (error == ESP_OK) {
@@ -365,12 +397,21 @@ void pollRecording(uint32_t now) {
   uint8_t fresh[sizeof(pcmPending)];
   const size_t bytes = audio.readCapture(fresh, sizeof(fresh));
   if (!bytes) return;
+  for (size_t i = 0; i + 1 < bytes; i += 2) {
+    const int16_t value = static_cast<int16_t>(uint16_t(fresh[i]) | (uint16_t(fresh[i + 1]) << 8));
+    if (value < micMinimum) micMinimum = value;
+    if (value > micMaximum) micMaximum = value;
+    if (micSamples && value != micPrevious) ++micChanges;
+    if (value == -32768 || value == 32767) ++micClipped;
+    micPrevious = value; micSum += value;
+    micSquares += uint64_t(int64_t(value) * value); ++micSamples;
+  }
   if (sdCapturing && recordings.enqueuePcm(fresh, bytes) != bytes) {
     recordings.stopRecording(false);
     report("SD record incomplete", ESP_ERR_NO_MEM);
   }
   if (networkCapturing) {
-    if (pcmLength) { micComplete = false; ++droppedFrames; }
+    if (pcmLength) { micComplete = false; ++droppedFrames; ++pendingReplacementDrops; }
     else {
       memcpy(pcmPending, fresh, bytes);
       pcmLength = bytes; pcmOffset = 0; pcmAt = now;
@@ -560,33 +601,97 @@ void pollButton(uint32_t now) {
   }
 }
 
-void printDiagnostic() {
-  if (!Serial) return;
-  Serial.println("AIOT-Basic: p/r=PTT a/s=App audio c=photo t=prompt l=preview x=cancel");
-  Serial.println("b/e=SD record/stop y=play latest u=upload latest PCM d=refresh list");
-  Serial.println("o=abort OTA v=confirm healthy OTA f=forget binding ?=diagnostics");
-  Serial.printf("link=%s, id=%s\n", Deotaland.stateName(Deotaland.state()),
+void appendDiagnostic(const char* format, ...) {
+  const size_t capacity = kDiagnosticBytes - diagnosticLogLength;
+  if (capacity < 2) return;
+  va_list arguments;
+  va_start(arguments, format);
+  const int count = std::vsnprintf(diagnosticLog + diagnosticLogLength, capacity, format, arguments);
+  va_end(arguments);
+  if (count > 0) diagnosticLogLength += min(size_t(count), capacity - 1);
+}
+
+void appendStreamDiagnostic(const char* name, agent_stream_t kind) {
+  agent_stream_status_t status = {};
+  const esp_err_t result = Deotaland.streamStatus(kind, &status);
+  if (result != ESP_OK) {
+    appendDiagnostic("%s streamStatus=%s\r\n", name, Deotaland.errorName(result));
+    return;
+  }
+  // State describes the last local stream; COMPLETED does not prove CoC is connected.
+  appendDiagnostic("%s state=%u sent=%lu accepted=%lu queued=%u rejected=%lu last=%s(%d)\r\n",
+                   name, unsigned(status.state), (unsigned long)status.sent_bytes,
+                   (unsigned long)status.accepted_bytes, unsigned(status.queued_bytes),
+                   (unsigned long)status.rejected_writes, Deotaland.errorName(status.last_error),
+                   int(status.last_error));
+}
+
+bool printDiagnostic() {
+  // Keep an unfinished snapshot and retain any new '?' request until it drains.
+  if (!Serial || diagnosticLogOffset < diagnosticLogLength) return false;
+  if (!diagnosticLog) {
+    const uint32_t now = millis();
+    if (diagnosticAllocationFailed && uint32_t(now - diagnosticAllocateAt) < 1000) return false;
+    diagnosticAllocateAt = now;
+    diagnosticLog = static_cast<char*>(heap_caps_malloc(kDiagnosticBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!diagnosticLog)
+      diagnosticLog = static_cast<char*>(heap_caps_malloc(kDiagnosticBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    diagnosticAllocationFailed = !diagnosticLog;
+    if (!diagnosticLog) return false; // Optional diagnostics cannot stop the app.
+  }
+  diagnosticLogOffset = diagnosticLogLength = 0;
+  appendDiagnostic("AIOT-Basic: p/r=PTT a/s=App audio c=photo t=prompt l=preview x=cancel\r\n");
+  appendDiagnostic("b/e=SD record/stop y=play latest u=upload latest PCM d=refresh list\r\n");
+  appendDiagnostic("o=abort OTA v=confirm healthy OTA f=forget binding ?=diagnostics\r\n");
+  appendDiagnostic("link=%s, id=%s\r\n", Deotaland.stateName(Deotaland.state()),
                 Deotaland.deviceId() ? Deotaland.deviceId() : "unavailable");
-  Serial.printf("init: PDM/I2S=%s LCD=%s Camera=%s Agent=%s\n",
+  appendDiagnostic("init: audio=%s LCD=%s Camera=%s Agent=%s\r\n",
                 Deotaland.errorName(audioError), Deotaland.errorName(screenError),
                 Deotaland.errorName(cameraError), Deotaland.errorName(beginError));
-  Serial.printf("runtime: audio ready=%u LCD ready=%u LCD error=%s\n", unsigned(audio.ready()),
+  appendDiagnostic("runtime: audio ready=%u capture ready=%u LCD ready=%u LCD error=%s\r\n", unsigned(audio.ready()), unsigned(audio.captureReady()),
                 unsigned(screen.ready()), Deotaland.errorName(screen.lastError()));
-  Serial.printf("SD=%s ready=%u recording=%u error=%s latest=%s list truncated=%u\n",
+  appendDiagnostic("SD=%s ready=%u recording=%u error=%s latest=%s list truncated=%u\r\n",
                 Deotaland.errorName(sdError), unsigned(recordings.ready()), unsigned(recordings.recording()),
                 Deotaland.errorName(recordings.lastError()), recordings.latestPath(), unsigned(recordings.listTruncated()));
-  Serial.printf("media: VOICE=%s AUDIO=%s IMAGE=%s playback=%s OTA=%s\n",
+  appendDiagnostic("media: VOICE=%s AUDIO=%s IMAGE=%s playback=%s OTA=%s\r\n",
                 Deotaland.errorName(voiceError), Deotaland.errorName(captureError),
                 Deotaland.errorName(imageError), Deotaland.errorName(playbackError),
                 Deotaland.errorName(otaError));
-  if (agent_link_ota_needs_reconnect()) Serial.println("OTA finished/aborted: reconnect before VOICE/AUDIO/TTS or another OTA.");
-  Serial.printf("mic accepted=%lluB, playback DMA=%lluB queued=%uB, dropped=%lu, images=%lu\n",
+  appendDiagnostic("BLE ATT_MTU=%u CoC81_connected=%u (shared AUDIO/TTS)\r\n",
+                   unsigned(agent_transport_ble_att_mtu()), unsigned(agent_transport_ble_l2cap_ready()));
+  appendStreamDiagnostic("VOICE", AGENT_STREAM_VOICE);
+  appendStreamDiagnostic("AUDIO", AGENT_STREAM_AUDIO);
+  appendStreamDiagnostic("IMAGE", AGENT_STREAM_IMAGE);
+  const agent_playback_stats_t playback = Deotaland.playbackStats();
+  appendDiagnostic("TTS active=%u acceptedPCM=%llu pendingPCM=%u sinkCalls=%lu backpressure=%lu\r\n",
+                   unsigned(Deotaland.playbackActive()), (unsigned long long)playback.accepted_pcm_bytes,
+                   unsigned(playback.pending_pcm_bytes), (unsigned long)playback.sink_calls,
+                   (unsigned long)playback.backpressure_events);
+  if (agent_link_ota_needs_reconnect()) appendDiagnostic("OTA finished/aborted: reconnect before VOICE/AUDIO/TTS or another OTA.\r\n");
+  appendDiagnostic("mic accepted=%lluB, playback DMA=%lluB queued=%uB, dropped=%lu, images=%lu\r\n",
                 (unsigned long long)capturedBytes, (unsigned long long)playedBytes,
                 unsigned(audio.playbackBytes()), (unsigned long)droppedFrames,
                 (unsigned long)uploadedImages);
-  Serial.printf("heap=%u, PSRAM=%u; READY needs 0xFFC4, VOICE needs 0xFFA1; CoC PSM 81/82\n",
-                unsigned(ESP.getFreeHeap()), unsigned(ESP.getFreePsram()));
-  if (AIOT_USE_WIFI) Serial.println("WiFi: provisioning/cloud only; no Agent media data plane.");
+  appendDiagnostic("mic drops: RX(queue+ISR)=%lu pendingTimeout=%lu pendingReplacement=%lu cancelPending=%lu\r\n",
+                   (unsigned long)captureDriverDrops, (unsigned long)pendingTimeoutDrops,
+                   (unsigned long)pendingReplacementDrops, (unsigned long)cancelPendingDrops);
+  const double mean = micSamples ? double(micSum) / micSamples : 0;
+  const double power = micSamples ? double(micSquares) / micSamples : 0;
+  const double variance = power > mean * mean ? power - mean * mean : 0;
+  appendDiagnostic("mic mode=%s channel=%s samples=%llu min=%d max=%d DC=%.2f acRMS=%.2f changes=%llu clipped=%llu\r\n",
+                AIOT_MIC_USE_PDM ? "PDM16" : "I2S32", AIOT_MIC_RIGHT_CHANNEL ? "RIGHT" : "LEFT",
+                (unsigned long long)micSamples, micSamples ? int(micMinimum) : 0,
+                micSamples ? int(micMaximum) : 0, mean, std::sqrt(variance),
+                (unsigned long long)micChanges, (unsigned long long)micClipped);
+  if (micSamples >= 16000 && !micChanges)
+    appendDiagnostic("MIC WARNING: constant PCM; check microphone power, wiring and selected channel. Driver ready does not prove sound input.\r\n");
+  appendDiagnostic("flash=%u PSRAM size=%u heap=%u minHeap=%u largestInternal=%u freePSRAM=%u largestPSRAM=%u\r\n",
+                unsigned(ESP.getFlashChipSize()), unsigned(ESP.getPsramSize()), unsigned(ESP.getFreeHeap()),
+                unsigned(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+                unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+                unsigned(ESP.getFreePsram()), unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)));
+  appendDiagnostic("READY needs 0xFFC4, VOICE needs 0xFFA1; CoC PSM 81/82\r\n");
+  return true;
 }
 
 void pollSerial(uint32_t now) {
@@ -616,18 +721,23 @@ void pollSerial(uint32_t now) {
     default: break;
     }
   }
-  if (Serial && textLogOffset < textLogLength) {
-    const size_t bytes = min(size_t(64), textLogLength - textLogOffset);
-    if (Serial.availableForWrite() >= int(bytes)) {
-      textLogOffset += Serial.write(reinterpret_cast<const uint8_t*>(textLog) + textLogOffset, bytes);
-      if (textLogOffset == textLogLength) Serial.println();
-    }
-  }
   if ((diagnosticPending && uint32_t(now - lastDiagnostic) >= 500) ||
       uint32_t(now - lastDiagnostic) >= 10000) {
-    diagnosticPending = false;
-    lastDiagnostic = now;
-    printDiagnostic();
+    if (printDiagnostic()) {
+      diagnosticPending = false;
+      lastDiagnostic = now;
+    }
+  }
+  if (!Serial) return;
+  // At most one 64-byte fragment per poll. CRLF is part of the text budget.
+  if (textLogOffset < textLogLength) {
+    const size_t bytes = min(size_t(64), textLogLength - textLogOffset);
+    if (Serial.availableForWrite() >= int(bytes))
+      textLogOffset += Serial.write(reinterpret_cast<const uint8_t*>(textLog) + textLogOffset, bytes);
+  } else if (diagnosticLogOffset < diagnosticLogLength) {
+    const size_t bytes = min(size_t(64), diagnosticLogLength - diagnosticLogOffset);
+    if (Serial.availableForWrite() >= int(bytes))
+      diagnosticLogOffset += Serial.write(reinterpret_cast<const uint8_t*>(diagnosticLog) + diagnosticLogOffset, bytes);
   }
 }
 
@@ -636,15 +746,14 @@ esp_err_t registerEndpoints() {
     cameraEndpoint.id = "camera0"; cameraEndpoint.dir = AGENT_IO_OUT;
     cameraEndpoint.kind = "camera.capture"; cameraEndpoint.value = AGENT_VAL_BOOL;
     cameraEndpoint.desc = "Capture a fresh camera JPEG and upload it to the App";
-    cameraEndpoint.args_schema = "{\"type\":\"boolean\"}";
+    cameraEndpoint.display_name = "Camera Snapshot";
     const esp_err_t error = Deotaland.registerIo(cameraEndpoint, onCamera);
     if (error != ESP_OK) return error;
   }
-  if (recordings.ready() && audioError == ESP_OK) {
+  if (recordings.ready() && audio.captureReady()) {
     recordingEndpoint.id = "recording0"; recordingEndpoint.dir = AGENT_IO_OUT;
     recordingEndpoint.kind = "audio.record"; recordingEndpoint.value = AGENT_VAL_BOOL;
     recordingEndpoint.desc = "True starts a local SD WAV recording; false stops and saves it";
-    recordingEndpoint.args_schema = "{\"type\":\"boolean\"}";
     const esp_err_t error = Deotaland.registerIo(recordingEndpoint, onRecording);
     if (error != ESP_OK) return error;
   }
@@ -653,25 +762,28 @@ esp_err_t registerEndpoints() {
     volumeEndpoint.kind = "speaker.volume"; volumeEndpoint.value = AGENT_VAL_U16;
     volumeEndpoint.unit = "%"; volumeEndpoint.range_max = 100;
     volumeEndpoint.desc = "I2S speaker software volume, 0 to 100 percent";
-    volumeEndpoint.args_schema = "{\"type\":\"integer\",\"minimum\":0,\"maximum\":100}";
     const esp_err_t error = Deotaland.registerIo(volumeEndpoint, onVolume);
     if (error != ESP_OK) return error;
   }
   uptimeEndpoint.id = "uptime0"; uptimeEndpoint.dir = AGENT_IO_IN;
   uptimeEndpoint.kind = "system.uptime"; uptimeEndpoint.value = AGENT_VAL_I32;
   uptimeEndpoint.unit = "s"; uptimeEndpoint.desc = "Elapsed boot time (seconds)";
+  uptimeEndpoint.audience = AGENT_AUD_USER; // Diagnostic reading, kept out of AI tools.
   return Deotaland.registerIo(uptimeEndpoint);
 }
 } // namespace
 
 void setup() {
   Serial.begin(115200); // Do not wait for a USB host before starting the device.
+#if ARDUINO_USB_CDC_ON_BOOT
+  Serial.setTxTimeoutMs(0); // Also bound a TX-lock/ring race after the capacity check.
+#endif
   if (AIOT_PTT_BUTTON_PIN >= 0) pinMode(AIOT_PTT_BUTTON_PIN, INPUT_PULLUP);
+  if (AIOT_ENABLE_SD) sdError = recordings.begin();
   audioError = audio.begin();
   if (audioError == ESP_OK) audioError = audio.setVolume(AIOT_INITIAL_VOLUME);
   screenError = screen.begin();
   cameraError = camera.begin();
-  if (AIOT_ENABLE_SD) sdError = recordings.begin();
   callbacks.on_audio_end = onAudioEnd;
   callbacks.on_show_text = onText;
   callbacks.on_led = onLed;
@@ -683,32 +795,27 @@ void setup() {
   config.firmware_rev = AIOT_FIRMWARE_VERSION;
   config.manufacturer = "Deotaland";
   config.caps = AGENT_CAP_LED | AGENT_CAP_SENSOR;
-  if (audioError == ESP_OK) config.caps |= AGENT_CAP_MIC | AGENT_CAP_SPEAKER | AGENT_CAP_ACTUATOR;
+  if (audioError == ESP_OK) config.caps |= AGENT_CAP_SPEAKER | AGENT_CAP_ACTUATOR;
+  if (audio.captureReady()) config.caps |= AGENT_CAP_MIC;
   if (screenError == ESP_OK) config.caps |= AGENT_CAP_SCREEN;
   if (cameraError == ESP_OK) config.caps |= AGENT_CAP_CAMERA | AGENT_CAP_ACTUATOR;
   if (AIOT_PTT_BUTTON_PIN >= 0) config.caps |= AGENT_CAP_BUTTON;
-  if (recordings.ready() && audioError == ESP_OK) config.caps |= AGENT_CAP_RECORDING;
+  if (recordings.ready() && audio.captureReady()) config.caps |= AGENT_CAP_RECORDING;
   config.output = &callbacks;
   config.on_state = onState;
   config.on_status = onStatus;
-  config.transport = AIOT_USE_WIFI ? AGENT_TRANSPORT_WIFI : AGENT_TRANSPORT_BLE;
-  agent_wifi_config_t wifi = {AIOT_WIFI_SSID, AIOT_WIFI_PASSWORD};
-  agent_platform_t platform = {AIOT_PLATFORM_ORIGIN, AIOT_PLATFORM_PRODUCT_ID, AIOT_PLATFORM_CHIP_TYPE};
-  if (AIOT_USE_WIFI) {
-    if (AIOT_WIFI_SSID[0]) config.wifi = &wifi;
-    if (AIOT_PLATFORM_PRODUCT_ID > 0) config.platform = &platform;
-  }
+  config.transport = AGENT_TRANSPORT_BLE;
   // The provided board-specific CSV has only ota_0. Require a real second slot
   // and otadata; e.g. official min_spiffs. Do not promise OTA on a single slot.
   const esp_partition_t* running = esp_ota_get_running_partition();
   const esp_partition_t* update = esp_ota_get_next_update_partition(nullptr);
-  config.enable_ota = AIOT_ENABLE_OTA && !AIOT_USE_WIFI && running && update &&
+  config.enable_ota = AIOT_ENABLE_OTA && running && update &&
       update->address != running->address &&
       esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_OTA, nullptr);
   beginError = registerEndpoints();
   if (beginError == ESP_OK) beginError = Deotaland.begin(config);
   started = beginError == ESP_OK;
-  if (started && !AIOT_USE_WIFI) {
+  if (started) {
     if (audioError == ESP_OK) {
       voiceError = Deotaland.prepareStreams(1u << AGENT_STREAM_VOICE);
       captureError = Deotaland.prepareStreams(1u << AGENT_STREAM_AUDIO);
@@ -741,10 +848,12 @@ void loop() {
       const esp_err_t error = Deotaland.pushPrompt("你好");
       if (!retryable(error)) { promptPending = false; report("prompt", error); }
     }
-    if (uint32_t(now - lastReading) >= 1000) {
+#if AIOT_UPTIME_REPORT_INTERVAL_MS > 0
+    if (uint32_t(now - lastReading) >= AIOT_UPTIME_REPORT_INTERVAL_MS) {
       lastReading = now;
       Deotaland.updateInt32("uptime0", int32_t(now / 1000));
     }
+#endif
   }
   // SD recording and local replay work even without a BLE connection.
   pollRecording(now);

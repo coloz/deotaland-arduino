@@ -38,7 +38,9 @@ public:
     bool listTruncated() const;
     // Korvo 0x04 payload: empty, offset LE16 + max entries, or + scope (0/1).
     // *responseBytes is input capacity and output used; minimum response is 7B.
-    // This serialises only the directory cache. The caller applies its ATT budget.
+    // This serialises only the directory cache, grown on the worker as needed.
+    // An incomplete scan/allocation failure returns an error, not a partial
+    // successful directory. The caller applies its ATT budget.
     esp_err_t handleList(const uint8_t* request, size_t requestBytes,
                          uint8_t* response, size_t* responseBytes);
 

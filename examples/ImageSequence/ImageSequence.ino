@@ -174,9 +174,8 @@ void setup() {
   cameraEndpoint.dir = AGENT_IO_OUT;
   cameraEndpoint.kind = "camera.capture";
   cameraEndpoint.value = AGENT_VAL_BOOL;
-  cameraEndpoint.display_name = "Synthetic Image Sequence";
+  cameraEndpoint.display_name = "Camera Snapshot";
   cameraEndpoint.desc = "True sends three synthetic RGB565 still images; false cancels. No real camera.";
-  cameraEndpoint.args_schema = "{\"type\":\"boolean\"}";
   beginError = Deotaland.registerIo(cameraEndpoint, onCamera);
   if (beginError == ESP_OK)
     beginError = Deotaland.begin("Deotaland-ImageSequence", AGENT_CAP_CAMERA, nullptr, onState);

@@ -52,14 +52,23 @@ void loop() {
 - `cancel()` 停止读取图片并安排取消结束；继续调用 `poll()` 完成清理，直到 `busy()` 为 false。断连会使任务失败，调用方需为新连接重新采集照片。
 - Completed 只表示全部数据和结束标记已被本地接受。使用 `Deotaland.streamStatus(AGENT_STREAM_IMAGE, &status)` 查看后台排空；开始下一张照片前应等待排空。协议没有图片送达 ACK，不能据此宣称 App 已成功展示或保存。
 
+API 的 `encoding` 与 BLE `0x54 ImageStart` 的 `format` 编号不同，BLE 后端负责转换；调用方仍使用公开枚举，不需修改图片或枚举值。
+
+| 图片 | API `encoding` | `0x54` 的 `format` |
+| --- | --- | --- |
+| JPEG | `AGENT_ENC_JPEG`（1） | 0 |
+| 大端 RGB565 | `AGENT_ENC_RAW`（0） | 1 |
+
+0.8.2 修正了这层转换。此前直接发送 API 枚举，会把 JPEG 标成 RGB565、把 RGB565 标成 JPEG，即使字节全部提交，接收端仍可能拒绝或无法解码。
+
 ## 接入其他相机
 
 修改 CameraSnapshot 的引脚及像素格式配置。GC2145 没有原生 JPEG，必须采集 RGB565 后用 `frame2jpg()` 编码。示例为 GC2145 保留原版的采集引擎启动处理，仅在识别到该传感器时执行。
 
 相机帧和 JPEG 缓冲区必须各释放一次。采集结果在后台完成后移交主循环；如果断线、请求过期或上传失败，示例会丢弃并释放该结果。不要在 BLE 回调或中断中调用相机驱动、JPEG 编码或上传器。
 
-自定义传输可实现 IMAGE 流来复用上传器。内置 Wi-Fi 后端仍只提供联网、配网及平台激活/鉴权/心跳，没有媒体数据通道。本功能完成设备到 App 的协议链路；配套 App SDK 不在本仓库内。
+自定义传输可实现 IMAGE 流来复用上传器。内置图片传输使用 BLE CoC。本功能完成设备到 App 的 BLE 协议链路；配套 App SDK 不在本仓库内。
 
 无需相机时，先使用 [StoredJpegUpload](../examples/StoredJpegUpload/StoredJpegUpload.ino) 发送 Flash 中的真实 JPEG；[ImageSequence](../examples/ImageSequence/ImageSequence.ino) 演示连续 RGB565 测试图、进度与取消。[CoCDiagnostics](../examples/CoCDiagnostics/CoCDiagnostics.ino) 区分编译支持和对端通道就绪。
 
-相机板与配套 App 尚未完成实机联调。请在实际设备检查颜色、JPEG 解码、完整收图、断线重连与持续传输；本地完成状态不能代替 App 的接收结果。
+ESP32-S3 AIOT-Basic 与 RoRoLee Android 3.4.2 已完成一次 App 调用 `camera0`、接收照片并返回画面描述的实测，记录见 [硬件验证](HARDWARE-VALIDATION.zh-CN.md)。其他板卡、RAW 接收、颜色与连续传输仍应分别验收；本地完成状态不能代替 App 的接收结果。

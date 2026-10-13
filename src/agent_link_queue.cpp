@@ -14,6 +14,7 @@ size_t head = 0, count = 0;
 bool accepting = false;
 uint32_t dropped = 0, high_water = 0;
 uint32_t generation = 0;
+uint32_t deferred_ticket = 0, deferred_generation = 0, deferred_done = 0;
 agent_link_status_t status = {};
 bool status_pending = false;
 #if defined(ARDUINO_ARCH_ESP32)
@@ -29,6 +30,7 @@ void RxEnable(bool enabled) {
     accepting = enabled;
     ++generation;
     count = head = 0;
+    deferred_ticket = deferred_generation = deferred_done = 0;
     if (enabled) dropped = high_water = 0;
 }
 esp_err_t RxPush(RxKind kind, agent_stream_t stream, const uint8_t* data, size_t n) {
@@ -44,6 +46,7 @@ esp_err_t RxPush(RxKind kind, agent_stream_t stream, const uint8_t* data, size_t
             queue[head].kind == RxKind::Connection && queue[head].length == 1 &&
             queue[head].data[0] == 0;
         ++generation;
+        deferred_ticket = deferred_generation = deferred_done = 0;
         if (keep_disconnect) { count = 1; queue[head].generation = generation; }
         else count = head = 0;
     }
@@ -74,6 +77,43 @@ bool RxPop(RxEvent& out) {
 }
 bool RxHasSpace() { Guard guard; (void)guard; return accepting && count < AGENT_LINK_RX_SLOTS - 2 - AGENT_LINK_RX_CONTROL_RESERVE; }
 uint32_t RxGeneration() { Guard guard; (void)guard; return generation; }
+esp_err_t RxPushDeferredStream(agent_stream_t stream, uint32_t ticket, uint32_t origin_generation) {
+    if (!ticket) return ESP_ERR_INVALID_ARG;
+    uint8_t marker[8];
+    for (unsigned i=0;i<4;++i) {
+        marker[i]=static_cast<uint8_t>(ticket>>(i*8));
+        marker[i+4]=static_cast<uint8_t>(origin_generation>>(i*8));
+    }
+    // A retained SDU uses a control-reserved slot so its later END still fits.
+    return RxPush(RxKind::DeferredStream,stream,marker,sizeof(marker));
+}
+bool RxDeferredBegin(uint32_t ticket, uint32_t expected_generation) {
+    Guard guard; (void)guard;
+    if (!accepting || !ticket || generation != expected_generation) return false;
+    deferred_ticket=ticket; deferred_generation=generation; deferred_done=0;
+    return true;
+}
+uint32_t RxDeferredTicket() {
+    Guard guard; (void)guard;
+    return accepting && deferred_generation==generation ? deferred_ticket : 0;
+}
+bool RxDeferredActive(uint32_t ticket) { return ticket && RxDeferredTicket()==ticket; }
+bool RxDeferredHasSpace() {
+    Guard guard; (void)guard;
+    return accepting && count < AGENT_LINK_RX_SLOTS-2;
+}
+void RxDeferredComplete(uint32_t ticket) {
+    Guard guard; (void)guard;
+    if (accepting && ticket && deferred_ticket==ticket && deferred_generation==generation) deferred_done=ticket;
+}
+bool RxDeferredDone(uint32_t ticket) {
+    Guard guard; (void)guard;
+    return accepting && ticket && deferred_ticket==ticket && deferred_done==ticket && deferred_generation==generation;
+}
+void RxDeferredEnd(uint32_t ticket) {
+    Guard guard; (void)guard;
+    if (deferred_ticket==ticket) deferred_ticket=deferred_generation=deferred_done=0;
+}
 void RxStats(agent_link_stats_t* out) {
     if (!out) return;
     Guard guard; (void)guard;
@@ -90,8 +130,6 @@ void StatusPush(const agent_link_status_t* value) {
     status = *value;
     status.title[sizeof(status.title)-1] = 0;
     status.hint[sizeof(status.hint)-1] = 0;
-    status.code[sizeof(status.code)-1] = 0;
-    status.wifi_ip[sizeof(status.wifi_ip)-1] = 0;
     status_pending = true;
 }
 void StatusGet(agent_link_status_t* out) {

@@ -10,6 +10,7 @@
 #include <cstring>
 #include <string>
 #include "agent_link_buffer.h"
+#include "agent_link_task_storage.h"
 #include "agent_link_log.h"
 #include "agent_link_queue.h"
 #include "audio_downlink.h"
@@ -17,6 +18,7 @@
 #include "agent_link_identity.h"
 #include "device_identity.h"
 #include <algorithm>
+#include <array>
 #include <cmath>
 
 struct agent_stream_session { agent_stream_t kind; bool open; agent_stream_handle_t handle; };
@@ -39,6 +41,8 @@ unsigned s_end_cursor = 0;
 unsigned s_reading_cursor = 0;
 bool s_audio_end_pending = false;
 bool s_audio_finished = false;
+bool s_direct_bulk = false; // poll-only while dispatching a retained FIFO stream marker
+uint32_t s_direct_bulk_generation = 0;
 // A retry of the most recent successful VoiceReply must ACK without replaying
 // Arm/Finish. Those side effects clear staged PCM or call the board's END twice.
 // Only exact consecutive requests are deduplicated: another command invalidates
@@ -61,15 +65,13 @@ size_t s_response_size = 0;
 agentlink::RxEvent s_rx_event;
 size_t s_rx_offset = 0;
 bool s_rx_pending = false;
-agentlink::FixedText<AGENT_LINK_MANIFEST_BYTES> s_manifest;
+agentlink::TaskStorage<agentlink::FixedText<AGENT_LINK_MANIFEST_BYTES>> s_manifest_storage;
+agentlink::FixedText<AGENT_LINK_MANIFEST_BYTES>& Manifest() { return s_manifest_storage.get(); }
 int s_manifest_build_index = -1;
 bool s_manifest_building = false;
 size_t s_manifest_offset = 0, s_manifest_budget = 0;
 uint16_t s_manifest_index = 0;
 std::string s_name, s_manufacturer, s_model, s_firmware;
-std::string s_ssid, s_password, s_base_url, s_chip_type;
-agent_platform_t s_platform = {};
-agent_wifi_config_t s_wifi_cfg = {};
 uint8_t s_device_id[16] = {};
 char s_identity_text[37] = {};
 
@@ -88,7 +90,7 @@ size_t BuildDeviceInfo(uint8_t* out, size_t capacity) {
     uint8_t mac[6] = {};
     if (s_cfg.transport == AGENT_TRANSPORT_BLE) agent_transport_ble_get_mac(mac);
     memcpy(out + p, mac, 6); p += 6;
-    // Battery is populated by the caller below; voltage and Wi-Fi cloud state are unknown.
+    // Battery is populated by the caller below; other reserved power fields stay zero.
     out[p++] = 0; out[p++] = 0; out[p++] = 0; out[p++] = 0;
     out[p++] = static_cast<uint8_t>(vn);
     memcpy(out+p,s_firmware.data(),vn); p += vn;
@@ -99,13 +101,16 @@ size_t BuildDeviceInfo(uint8_t* out, size_t capacity) {
 }
 
 bool Ready() { return s_running && s_generation == agentlink::RxGeneration() && s_tx && s_tx->is_ready && s_tx->is_ready(s_tx->impl) && s_state == AGENT_STATE_READY; }
+bool ControlReady() {
+    return Ready();
+}
 size_t ControlMtu() {
     size_t n = 20;
     if (s_tx && s_tx->ctrl_mtu) n = s_tx->ctrl_mtu(s_tx->impl);
     else if (s_cfg.transport == AGENT_TRANSPORT_BLE) {
         const size_t att = agent_transport_ble_att_mtu();
         n = att >= 23 ? att - 3 : 20;
-    } else if (s_cfg.transport == AGENT_TRANSPORT_WIFI) n = 1030;
+    }
     return std::min(n, size_t(1030));
 }
 size_t PayloadBudget() {
@@ -114,7 +119,7 @@ size_t PayloadBudget() {
     return s_cfg.transport==AGENT_TRANSPORT_BLE ? std::min(payload,size_t(480)) : payload;
 }
 esp_err_t SendControl(const uint8_t* p, size_t n) {
-    if (!Ready() || !s_tx->send_ctrl) return ESP_ERR_INVALID_STATE;
+    if (!ControlReady() || !s_tx || !s_tx->send_ctrl) return ESP_ERR_INVALID_STATE;
     if (!p || n < 6 || n > ControlMtu()) return ESP_ERR_INVALID_SIZE;
     const esp_err_t e = s_tx->send_ctrl(s_tx->impl, p, n);
     if (e != ESP_OK) s_stats.last_error = e;
@@ -150,12 +155,22 @@ void QueueConnection(bool connected) {
     (void)agentlink::RxPush(agentlink::RxKind::Connection, AGENT_STREAM_VOICE, &b, 1);
 }
 void QueueReady() { (void)agentlink::RxPush(agentlink::RxKind::Ready, AGENT_STREAM_VOICE, nullptr, 0); }
+size_t OnStreamData(agent_stream_t type, const uint8_t* data, size_t len);
 size_t ReceiveBulk(const uint8_t* p, size_t n) {
     if (agentlink::ota::OwnsDataChannel()) return agentlink::ota::FeedData(p,n);
     n = std::min(n, size_t(AGENT_LINK_RX_BYTES));
+    if (s_direct_bulk) {
+        // Subscription changes can retire control without retiring the physical
+        // CoC channel. Discard that old TTS, while OTA above keeps its ownership.
+        if (s_direct_bulk_generation != agentlink::RxGeneration() || !Ready()) return n;
+        return OnStreamData(AGENT_STREAM_VOICE,p,n);
+    }
     return QueueStream(AGENT_STREAM_VOICE,p,n) == ESP_OK ? n : 0;
 }
-bool ReceiveSpace() { return agentlink::ota::OwnsDataChannel() ? agentlink::ota::WantsMore() : agentlink::RxHasSpace(); }
+bool ReceiveSpace() {
+    if (agentlink::ota::OwnsDataChannel()) return agentlink::ota::WantsMore();
+    return s_direct_bulk || agentlink::RxHasSpace();
+}
 const agent_transport_callbacks_t kCallbacks = {QueueCtrl, QueueStream, QueueConnection, QueueReady, agentlink::StatusPush};
 
 void LinkStatus(agent_link_phase_t phase, const char* title, const char* hint) {
@@ -197,7 +212,8 @@ struct IoEntry {
     bool pending;
 };
 
-IoEntry s_io[kMaxIo] = {};
+agentlink::TaskStorage<std::array<IoEntry,kMaxIo>> s_io_storage;
+std::array<IoEntry,kMaxIo>& IoEntries() { return s_io_storage.get(); }
 int     s_io_count = 0;
 bool    s_manifest_sent = false;  // whether the manifest has been sent in this connection
 uint32_t s_manifest_rev = 1;
@@ -227,15 +243,15 @@ esp_err_t not_ready(const char* what) {
 const IoEntry* FindIo(const char* id) {
     if (!id) return nullptr;
     for (int i = 0; i < s_io_count; ++i)
-        if (s_io[i].desc && s_io[i].desc->id && strcmp(s_io[i].desc->id, id) == 0)
-            return &s_io[i];
+        if (IoEntries()[i].desc && IoEntries()[i].desc->id && strcmp(IoEntries()[i].desc->id, id) == 0)
+            return &IoEntries()[i];
     return nullptr;
 }
 
 int FindIoIndex(const char* id) {
     if (!id) return -1;
     for (int i = 0; i < s_io_count; ++i) {
-        if (s_io[i].desc && s_io[i].desc->id && strcmp(s_io[i].desc->id, id) == 0) return i;
+        if (IoEntries()[i].desc && IoEntries()[i].desc->id && strcmp(IoEntries()[i].desc->id, id) == 0) return i;
     }
     return -1;
 }
@@ -373,7 +389,7 @@ bool CanRegisterSyntheticEndpoints(const agent_link_config_t& cfg) {
     int occupied = 0;
     bool led = false, haptic = false, screen = false;
     for (int i=0; i<s_io_count; ++i) {
-        const auto* d=s_io[i].desc;
+        const auto* d=IoEntries()[i].desc;
         if (d==&kSynthLed || d==&kSynthHaptic || d==&kSynthScreen) continue;
         ++occupied;
         led |= strcmp(d->id,"led0")==0;
@@ -395,7 +411,7 @@ void NextManifestTokens() {
             unsigned(AGENT_LINK_PROTO_VERSION),unsigned(s_manifest_rev),unsigned(s_cfg.caps));
         ManifestTokenAdd(s_manifest_number); s_manifest_build_index=0;
     } else if (s_manifest_build_index < s_io_count) {
-        const auto* d=s_io[s_manifest_build_index].desc;
+        const auto* d=IoEntries()[s_manifest_build_index].desc;
         if (s_manifest_build_index++) ManifestTokenAdd(",");
         ManifestTokenAdd("{\"id\":\""); ManifestTokenAdd(d->id,true);
         ManifestTokenAdd("\",\"dir\":\""); ManifestTokenAdd(d->dir==AGENT_IO_OUT?"out":"in");
@@ -428,9 +444,9 @@ void NextManifestTokens() {
 }
 // At most STEP_BYTES output bytes; descriptor length cannot monopolize loop().
 void BuildManifestStep() {
-    for(size_t work=0;work<AGENT_LINK_MANIFEST_STEP_BYTES && s_manifest.good();) {
+    for(size_t work=0;work<AGENT_LINK_MANIFEST_STEP_BYTES && Manifest().good();) {
         if(s_manifest_escape_offset<s_manifest_escape_size) {
-            s_manifest+=s_manifest_escape[s_manifest_escape_offset++]; ++work; continue;
+            Manifest()+=s_manifest_escape[s_manifest_escape_offset++]; ++work; continue;
         }
         if(s_manifest_token_index==s_manifest_token_count) {
             if(s_manifest_final_tokens) { s_manifest_building=false; break; }
@@ -446,25 +462,25 @@ void BuildManifestStep() {
             const char hex[]="0123456789abcdef";
             memcpy(s_manifest_escape,"\\u00",4);
             s_manifest_escape[4]=hex[c>>4]; s_manifest_escape[5]=hex[c&15]; s_manifest_escape_size=6;
-        } else { s_manifest+=static_cast<char>(c); ++work; }
+        } else { Manifest()+=static_cast<char>(c); ++work; }
     }
-    if (!s_manifest.good()) {
+    if (!Manifest().good()) {
         s_stats.last_error=ESP_ERR_INVALID_SIZE;
-        s_manifest.clear(); s_manifest_building=false;
+        Manifest().clear(); s_manifest_building=false;
     }
 }
 
 // Send the manifest, fragmented into 0x18 IoManifest events over the control plane (send_ctrl).
 //   Each chunk payload = [chunk_idx(1)] [last(1: 0/1)] [json fragment...]; the App concatenates
 //   chunks in order until last=1, then parses the whole JSON.
-// Triggered: after the BLE peer subscribes to 0xFFC4 (OnLinkReady) / after WiFi connects (OnConn) /
+// Triggered: after the BLE peer subscribes to 0xFFC4 (OnLinkReady) /
 //   on the App's 0x34 fetch command.
 void SendManifest(bool force) {
     if (!s_tx || (!force && s_manifest_sent)) return;
     // Repeated fetches of the same revision must not restart an in-flight build.
-    if ((s_manifest_building || !s_manifest.empty()) && s_manifest_build_revision==s_manifest_rev) return;
+    if ((s_manifest_building || !Manifest().empty()) && s_manifest_build_revision==s_manifest_rev) return;
     s_manifest_build_revision=s_manifest_rev;
-    s_manifest.clear(); s_manifest_build_index=-1; s_manifest_building=true;
+    Manifest().clear(); s_manifest_build_index=-1; s_manifest_building=true;
     s_manifest_token_count=s_manifest_token_index=0;
     s_manifest_escape_size=s_manifest_escape_offset=0; s_manifest_final_tokens=false;
     s_manifest_sent = false;
@@ -474,9 +490,9 @@ void SendManifest(bool force) {
 
 // Exactly one fragment attempt per poll; preserve offset on congestion.
 void PumpManifest() {
-    if (!Ready()) return;
+    if (!ControlReady()) return;
     if (s_manifest_building) { ++s_stats.manifest_build_steps; BuildManifestStep(); return; }
-    if (s_manifest.empty()) return;
+    if (Manifest().empty()) return;
     const size_t payload = PayloadBudget();
     if (payload <= 2) { s_stats.last_error = ESP_ERR_INVALID_SIZE; return; }
     const size_t budget = std::min(payload - 2, size_t(480));
@@ -484,28 +500,33 @@ void PumpManifest() {
         s_manifest_budget = budget;
         s_manifest_offset = s_manifest_index = 0;
     }
-    if (s_manifest.size() > budget * 256) {
+    if (Manifest().size() > budget * 256) {
         s_stats.last_error = ESP_ERR_INVALID_SIZE;
         return; // A later MTU exchange can make the manifest fit.
     }
-    const size_t n = std::min(budget, s_manifest.size() - s_manifest_offset);
+    const size_t n = std::min(budget, Manifest().size() - s_manifest_offset);
     uint8_t chunk[482];
     chunk[0] = static_cast<uint8_t>(s_manifest_index);
-    chunk[1] = s_manifest_offset + n == s_manifest.size();
-    memcpy(chunk + 2, s_manifest.data() + s_manifest_offset, n);
-    if (SendReliableServiceEvent(0x18,chunk,n+2) != ESP_OK) { ++s_stats.tx_retries; return; }
+    chunk[1] = s_manifest_offset + n == Manifest().size();
+    memcpy(chunk + 2, Manifest().data() + s_manifest_offset, n);
+    const esp_err_t result=SendReliableServiceEvent(0x18,chunk,n+2);
+    if (result != ESP_OK) {
+        if (result==ESP_ERR_NO_MEM || result==ESP_ERR_TIMEOUT) ++s_stats.tx_retries;
+        else Manifest().clear(); // A permanent backend rejection must not monopolize future polls.
+        return;
+    }
     s_manifest_offset += n;
     ++s_manifest_index;
     ++s_stats.manifest_fragments;
-    if (s_manifest_offset == s_manifest.size()) { s_manifest_sent = true; s_manifest.clear(); }
+    if (s_manifest_offset == Manifest().size()) { s_manifest_sent = true; Manifest().clear(); }
 }
 
 // BLE: fired after the peer subscribes to the event channel 0xFFC4 (notifications are only
 // delivered from that point on) -> send the manifest.
 void OnLinkReady() {
     // A BLE ACL connection alone cannot carry device events: READY begins when
-    // the peer enables the 0xFFC4 notification channel. WiFi has no data plane.
-    if (s_cfg.transport != AGENT_TRANSPORT_WIFI && s_state != AGENT_STATE_READY) {
+    // the peer enables the 0xFFC4 notification channel.
+    if (s_state != AGENT_STATE_READY) {
         s_state = AGENT_STATE_READY;
         LinkStatus(AGENT_LINK_PHASE_READY, "Ready", "Connected to the agent");
         if (s_cfg.on_state) s_cfg.on_state(s_state, s_cfg.state_ctx);
@@ -515,17 +536,15 @@ void OnLinkReady() {
 
 // Transport -> core: connection state change.
 void OnConn(bool connected) {
-    // Platform authentication alone does not imply a usable data plane.
     s_state = connected ? AGENT_STATE_CONNECTED : AGENT_STATE_DISCONNECTED;
-    if (s_cfg.transport != AGENT_TRANSPORT_WIFI)
-        LinkStatus(connected ? AGENT_LINK_PHASE_CONNECTED : AGENT_LINK_PHASE_SETUP,
-                   connected ? "Connected" : "Set up link",
-                   connected ? "Waiting for the event channel" : "Open the App to connect");
-    s_manifest.clear(); s_manifest_building=false;
+    LinkStatus(connected ? AGENT_LINK_PHASE_CONNECTED : AGENT_LINK_PHASE_SETUP,
+               connected ? "Connected" : "Set up link",
+               connected ? "Waiting for the event channel" : "Open the App to connect");
+    Manifest().clear(); s_manifest_building=false;
     s_response_size = 0;
     for (auto& stream : s_streams) stream.open = false;
     for (auto& pending : s_pending_stream_end) pending=false;
-    for (auto& io : s_io) {
+    for (auto& io : IoEntries()) {
         io.has_sent = false; io.last_sent_ms = 0;
         io.policy_mode=IO_POLICY_PASSTHROUGH; io.policy_rate_hz=0;
         io.pending=io.has_last;
@@ -535,7 +554,7 @@ void OnConn(bool connected) {
     agentlink::audio::OnLinkState(false);
     s_audio_end_pending=s_audio_finished=false;
     s_voice_reply_seen=false;
-    s_manifest_sent = false;      // reset on connect and disconnect: re-send after 0xFFC4 subscribe (BLE) / after connect (WiFi)
+    s_manifest_sent = false;      // Re-send after the event channel becomes ready.
     if (!connected) {
 
     } else {
@@ -640,7 +659,9 @@ void OnCtrlFrame(const uint8_t* data, size_t len) {
     } else if (f.command_id == 0x34) {
         // 0x34 GetIoManifest: App-initiated fetch -> (re)send the manifest (0x18), then reply with the usual ACK.
         if (!f.payload.empty()) { status=1; error=1004; }
-        else SendManifest(/*force=*/true);
+        else {
+            SendManifest(/*force=*/true);
+        }
     } else if (f.command_id == 0x35) {
         // GetReading: [id_len][id] -> [type][age_ms LE][cached value].
         const auto& pl = f.payload;
@@ -652,19 +673,19 @@ void OnCtrlFrame(const uint8_t* data, size_t len) {
             memcpy(io_id, pl.data() + 1, pl[0]);
             io_id[pl[0]] = '\0';
             const int idx = FindIoIndex(io_id);
-            if (idx < 0 || s_io[idx].desc->dir != AGENT_IO_IN) {
+            if (idx < 0 || IoEntries()[idx].desc->dir != AGENT_IO_IN) {
                 status = 1; error = 1003;
-            } else if (!s_io[idx].has_last) {
+            } else if (!IoEntries()[idx].has_last) {
                 status = 1; error = 1005;
             } else {
-                const uint32_t age = agent_link_now_ms() - s_io[idx].last_ts_ms;
+                const uint32_t age = agent_link_now_ms() - IoEntries()[idx].last_ts_ms;
                 const uint16_t age_ms = age > 0xFFFF ? 0xFFFF : static_cast<uint16_t>(age);
                 size_t k = 0;
-                extra[k++] = static_cast<uint8_t>(s_io[idx].desc->value);
+                extra[k++] = static_cast<uint8_t>(IoEntries()[idx].desc->value);
                 extra[k++] = static_cast<uint8_t>(age_ms & 0xFF);
                 extra[k++] = static_cast<uint8_t>((age_ms >> 8) & 0xFF);
-                memcpy(extra + k, s_io[idx].last_val, s_io[idx].last_len);
-                extra_len = k + s_io[idx].last_len;
+                memcpy(extra + k, IoEntries()[idx].last_val, IoEntries()[idx].last_len);
+                extra_len = k + IoEntries()[idx].last_len;
             }
         }
     } else if (f.command_id == 0x36) {
@@ -686,16 +707,16 @@ void OnCtrlFrame(const uint8_t* data, size_t len) {
                        (static_cast<uint16_t>(pl[3 + id_len]) << 8);
             }
             const int idx = FindIoIndex(io_id);
-            if (idx < 0 || s_io[idx].desc->dir != AGENT_IO_IN) {
+            if (idx < 0 || IoEntries()[idx].desc->dir != AGENT_IO_IN) {
                 status = 1; error = 1003;
             } else if (mode > IO_POLICY_ONCHANGE || (mode == IO_POLICY_PERIODIC && rate == 0)) {
                 status = 1; error = 1004;
             } else {
-                s_io[idx].policy_mode = mode;
-                s_io[idx].policy_rate_hz = rate;
-                s_io[idx].last_sent_ms = 0;
-                s_io[idx].has_sent = false;
-                s_io[idx].pending = s_io[idx].has_last;
+                IoEntries()[idx].policy_mode = mode;
+                IoEntries()[idx].policy_rate_hz = rate;
+                IoEntries()[idx].last_sent_ms = 0;
+                IoEntries()[idx].has_sent = false;
+                IoEntries()[idx].pending = IoEntries()[idx].has_last;
                 ESP_LOGI(TAG, "reading config '%s': mode=%u rate=%uHz", io_id, mode,
                          static_cast<unsigned>(rate));
             }
@@ -769,7 +790,7 @@ size_t OnStreamData(agent_stream_t type, const uint8_t* data, size_t len) {
 // ── Lifecycle ───────────────────────────────────────────────────────────────────
 esp_err_t agent_link_init(const agent_link_config_t* cfg) {
     if (s_running || s_polling) return ESP_ERR_INVALID_STATE;
-    if (agent_transport_ble_active() || agent_transport_wifi_active() || agentlink::ota::WorkerActive()) return ESP_ERR_INVALID_STATE;
+    if (agent_transport_ble_active() || agentlink::ota::WorkerActive()) return ESP_ERR_INVALID_STATE;
     if (!cfg || !cfg->device_name || !cfg->device_name[0]) return ESP_ERR_INVALID_ARG;
     const char* model=cfg->model && *cfg->model ? cfg->model : cfg->device_name;
     const char* firmware=cfg->firmware_rev && *cfg->firmware_rev ? cfg->firmware_rev : "2.0.0";
@@ -778,22 +799,20 @@ esp_err_t agent_link_init(const agent_link_config_t* cfg) {
         BoundedLength(firmware,AGENT_LINK_FIRMWARE_MAX)>AGENT_LINK_FIRMWARE_MAX ||
         BoundedLength(cfg->manufacturer,AGENT_LINK_MANUFACTURER_MAX)>AGENT_LINK_MANUFACTURER_MAX)
         return ESP_ERR_INVALID_SIZE;
-    if (cfg->transport == AGENT_TRANSPORT_BOTH) return ESP_ERR_NOT_SUPPORTED;
-    if (cfg->transport != AGENT_TRANSPORT_BLE && cfg->transport != AGENT_TRANSPORT_WIFI && cfg->transport != AGENT_TRANSPORT_CUSTOM) return ESP_ERR_INVALID_ARG;
+    if (cfg->transport != AGENT_TRANSPORT_BLE && cfg->transport != AGENT_TRANSPORT_CUSTOM) return ESP_ERR_INVALID_ARG;
     if (cfg->transport == AGENT_TRANSPORT_CUSTOM && (!cfg->custom_transport || !cfg->custom_transport->start || !cfg->custom_transport->stop || !cfg->custom_transport->send_ctrl || !cfg->custom_transport->is_ready || !cfg->custom_transport->bind)) return ESP_ERR_INVALID_ARG;
     if (!CanRegisterSyntheticEndpoints(*cfg)) return ESP_ERR_NO_MEM;
-    if (cfg->transport == AGENT_TRANSPORT_WIFI && cfg->platform &&
-        (!cfg->platform->base_url || strncmp(cfg->platform->base_url,"https://",8) != 0 ||
-         strlen(cfg->platform->base_url) <= 8 || strlen(cfg->platform->base_url) > 95 ||
-         cfg->platform->product_id <= 0 || !cfg->platform->chip_type ||
-         !cfg->platform->chip_type[0] || strlen(cfg->platform->chip_type) > 31)) return ESP_ERR_INVALID_ARG;
+    // These buffers are used only by the application's poll/setup thread.
+    // Reserve before replacing configuration; allocation failure leaves the
+    // previous registry and transport bindings intact. ISR/RX storage stays internal.
+    if (!s_io_storage.prepare() || !s_manifest_storage.prepare()) return ESP_ERR_NO_MEM;
     if (s_initialized && s_cfg.transport == AGENT_TRANSPORT_CUSTOM && s_tx->bind) s_tx->bind(s_tx->impl,nullptr);
     // Synthetic endpoints belong to the configuration being replaced. User I/O survives stop.
     for (int i=0; i<s_io_count;) {
-        const auto* d=s_io[i].desc;
+        const auto* d=IoEntries()[i].desc;
         if (d==&kSynthLed || d==&kSynthHaptic || d==&kSynthScreen) {
-            for (int j=i+1; j<s_io_count; ++j) s_io[j-1]=s_io[j];
-            s_io[--s_io_count]={};
+            for (int j=i+1; j<s_io_count; ++j) IoEntries()[j-1]=IoEntries()[j];
+            IoEntries()[--s_io_count]={};
         } else ++i;
     }
     s_cfg = *cfg;
@@ -807,18 +826,6 @@ esp_err_t agent_link_init(const agent_link_config_t* cfg) {
     s_identity_text[0]=0;
     (void)dev_identity_load(false);
     s_cfg.device_id=dev_identity_uuid(s_device_id)?s_device_id:nullptr;
-    if (cfg->wifi) {
-        s_ssid=cfg->wifi->ssid?cfg->wifi->ssid:"";
-        s_password=cfg->wifi->password?cfg->wifi->password:"";
-        s_wifi_cfg={s_ssid.c_str(),s_password.c_str()};
-        s_cfg.wifi=&s_wifi_cfg;
-    }
-    if (cfg->platform) {
-        s_base_url=cfg->platform->base_url?cfg->platform->base_url:"";
-        s_chip_type=cfg->platform->chip_type?cfg->platform->chip_type:"";
-        s_platform={s_base_url.c_str(),cfg->platform->product_id,s_chip_type.c_str()};
-        s_cfg.platform=&s_platform;
-    }
     agentlink::StatusReset(s_cfg.transport);
     s_out = cfg->output ? *cfg->output : agent_output_cb_t{};
     s_have_out = cfg->output != nullptr;
@@ -839,16 +846,6 @@ esp_err_t agent_link_init(const agent_link_config_t* cfg) {
     case AGENT_TRANSPORT_CUSTOM:
         s_tx=s_cfg.custom_transport;
         s_tx->bind(s_tx->impl,&kCallbacks);
-        break;
-    case AGENT_TRANSPORT_WIFI:
-        s_tx=agent_transport_wifi();
-        agent_transport_wifi_set_config(s_cfg.wifi);
-        agent_transport_wifi_set_platform(s_cfg.platform, s_cfg.firmware_rev);
-        agent_transport_wifi_set_status(agentlink::StatusPush);
-        agent_transport_wifi_set_name(s_cfg.device_name);
-        agent_transport_wifi_set_recv(QueueCtrlLegacy);
-        agent_transport_wifi_set_conn(QueueConnection);
-        agent_transport_wifi_set_stream_recv(QueueStreamLegacy);
         break;
     default:
         s_tx=agent_transport_ble();
@@ -871,13 +868,13 @@ esp_err_t agent_link_start(void) {
     agentlink::RxEnable(true);
     s_generation=agentlink::RxGeneration();
     s_running=true;
-    LinkStatus(AGENT_LINK_PHASE_SETUP, "Set up link", "Open the App or join the device hotspot");
+    LinkStatus(AGENT_LINK_PHASE_SETUP, "Set up link", "Open the App to connect");
     const esp_err_t e=s_tx->start(s_tx->impl);
     if (e!=ESP_OK) { s_running=false; agentlink::RxEnable(false); agentlink::StatusReset(s_cfg.transport); }
     return e;
 }
 bool agent_link_can_begin(void) {
-    return !s_running && !s_polling && !agent_transport_ble_active() && !agent_transport_wifi_active() && !agentlink::ota::WorkerActive();
+    return !s_running && !s_polling && !agent_transport_ble_active() && !agentlink::ota::WorkerActive();
 }
 void agent_link_stop(void) {
     if (s_polling) { s_stats.last_error=ESP_ERR_INVALID_STATE; return; }
@@ -889,7 +886,8 @@ void agent_link_stop(void) {
     agentlink::StatusReset(s_cfg.transport);
     for(auto& stream:s_streams) stream.open=false;
     for(auto& pending:s_pending_stream_end) pending=false;
-    s_manifest.clear(); s_manifest_building=false; s_manifest_sent=false; s_response_size=0;
+    if (s_manifest_storage.prepared()) Manifest().clear();
+    s_manifest_building=false; s_manifest_sent=false; s_response_size=0;
     agentlink::audio::OnLinkState(false);
     s_audio_end_pending=false;
     s_voice_reply_seen=false;
@@ -904,18 +902,19 @@ void agent_link_deinit(void) {
     agent_transport_ble_set_ready(nullptr);
     agent_transport_ble_set_stream_recv(nullptr);
     agent_transport_ble_set_data_receiver(nullptr,nullptr);
-    agent_transport_wifi_set_recv(nullptr);
-    agent_transport_wifi_set_conn(nullptr);
-    agent_transport_wifi_set_stream_recv(nullptr);
-    agent_transport_wifi_set_status(nullptr);
     agent_link_ota_set_callback(nullptr,nullptr);
     agentlink::ota::SetReliableEventSink(nullptr);
     agentlink::ota::SetEventSink(nullptr);
     agentlink::audio::SetSinks(nullptr,nullptr);
     s_playback={};
     s_tx=nullptr; s_initialized=false; s_cfg={}; s_out={}; s_have_out=false;
-    for(auto& io:s_io) io={};
+    if (s_io_storage.prepared()) for(auto& io:IoEntries()) io={};
     s_io_count=0; s_manifest_rev=1;
+    s_manifest_token_count=s_manifest_token_index=0;
+    for(auto& token:s_manifest_tokens) token={};
+    s_manifest_escape_size=s_manifest_escape_offset=0;
+    s_manifest_final_tokens=false;
+    s_manifest_storage.release(); s_io_storage.release();
 }
 agent_state_t agent_link_state(void) {
     if (!s_running || s_generation != agentlink::RxGeneration()) return AGENT_STATE_DISCONNECTED;
@@ -941,7 +940,6 @@ bool agent_link_playback_active(void) { return Ready() && (agentlink::audio::IsA
 esp_err_t agent_link_forget(void) {
     if (!s_running || s_polling) return ESP_ERR_INVALID_STATE;
     if (s_cfg.transport == AGENT_TRANSPORT_BLE) return agent_transport_ble_forget();
-    if (s_cfg.transport == AGENT_TRANSPORT_WIFI) return agent_transport_wifi_forget();
     return ESP_ERR_NOT_SUPPORTED;
 }
 void agent_link_get_stats(agent_link_stats_t* out) {
@@ -986,7 +984,7 @@ bool PumpRx(bool& response_blocked) {
     switch(event.kind) {
     case agentlink::RxKind::Connection: s_generation=event.generation; OnConn(event.data[0]!=0); break;
     case agentlink::RxKind::Ready: if(s_state!=AGENT_STATE_DISCONNECTED) OnLinkReady(); break;
-    case agentlink::RxKind::Control: if(Ready()) OnCtrlFrame(event.data,event.length); break;
+    case agentlink::RxKind::Control: if(ControlReady()) OnCtrlFrame(event.data,event.length); break;
     case agentlink::RxKind::Stream:
         if(Ready()) {
             const size_t limit=agentlink::audio::CodecValue()==agentlink::audio::kCodecPcm16?512:256;
@@ -997,6 +995,23 @@ bool PumpRx(bool& response_blocked) {
             if(!accepted && n) { ++s_stats.playback_backpressure; return false; }
         }
         break;
+    case agentlink::RxKind::DeferredStream: {
+        if(event.length!=8) break;
+        uint32_t ticket=0, origin=0;
+        for(unsigned i=0;i<4;++i) {
+            ticket |= uint32_t(event.data[i])<<(i*8);
+            origin |= uint32_t(event.data[i+4])<<(i*8);
+        }
+        if(!agentlink::RxDeferredBegin(ticket,event.generation)) break;
+        s_direct_bulk=true; s_direct_bulk_generation=origin;
+        if(s_tx && s_tx->poll) s_tx->poll(s_tx->impl);
+        s_direct_bulk=false;
+        const bool finished=agentlink::RxDeferredDone(ticket);
+        agentlink::RxDeferredEnd(ticket);
+        s_rx_pending=!finished && event.generation==agentlink::RxGeneration();
+        if(s_rx_pending) return false; // END/next START must remain behind this SDU.
+        break;
+    }
     }
     return true;
 }
@@ -1132,18 +1147,19 @@ esp_err_t agent_link_register_io(const agent_link_io_desc_t* desc,
         ESP_LOGE(TAG, "register_io: registry full (max %d)", kMaxIo);
         return ESP_ERR_NO_MEM;
     }
-    s_io[s_io_count] = {};
-    s_io[s_io_count].desc = desc;
-    s_io[s_io_count].cb = cb;
-    s_io[s_io_count].ctx = ctx;
+    if (!s_io_storage.prepare()) return ESP_ERR_NO_MEM;
+    IoEntries()[s_io_count] = {};
+    IoEntries()[s_io_count].desc = desc;
+    IoEntries()[s_io_count].cb = cb;
+    IoEntries()[s_io_count].ctx = ctx;
     ESP_LOGI(TAG, "register_io[%d]: id='%s' kind='%s' dir=%s",
              s_io_count, desc->id, desc->kind, desc->dir == AGENT_IO_OUT ? "out" : "in");
     s_io_count++;
     s_manifest_sent=false;
     if (s_running) (void)agent_link_notify_manifest_changed();
     // The manifest is serialized and sent during the connection handshake (BLE: after the 0xFFC4
-    // subscribe; WiFi: after connect), see SendManifest. Downlink actuator commands (0x33) are
-    // matched by id to s_io[].cb, see OnCtrlFrame.
+    // subscribe), see SendManifest. Downlink actuator commands (0x33) are
+    // matched by id to IoEntries()[].cb, see OnCtrlFrame.
     return ESP_OK;
 }
 
@@ -1197,7 +1213,7 @@ void PumpReading() {
     // Bounded scan; select at most one endpoint, preserving fairness on retry.
     for(int i=0;i<s_io_count;++i) {
         s_reading_cursor%=static_cast<unsigned>(s_io_count);
-        auto& e=s_io[s_reading_cursor++];
+        auto& e=IoEntries()[s_reading_cursor++];
         if(!e.has_last || e.desc->dir!=AGENT_IO_IN || e.policy_mode==IO_POLICY_OFF) continue;
         if(e.policy_mode==IO_POLICY_PERIODIC) {
             const uint32_t period=(1000u+e.policy_rate_hz-1u)/e.policy_rate_hz;
@@ -1218,8 +1234,8 @@ esp_err_t ValidateReading(const char* id,const void* value,size_t len,int& idx) 
     if(!id || !value) return ESP_ERR_INVALID_ARG;
     if(BoundedLength(id,63)>63) return ESP_ERR_INVALID_ARG;
     idx=FindIoIndex(id);
-    if(idx<0 || s_io[idx].desc->dir!=AGENT_IO_IN) return ESP_ERR_NOT_FOUND;
-    const auto type=s_io[idx].desc->value;
+    if(idx<0 || IoEntries()[idx].desc->dir!=AGENT_IO_IN) return ESP_ERR_NOT_FOUND;
+    const auto type=IoEntries()[idx].desc->value;
     if(!len && type!=AGENT_VAL_STR) return ESP_ERR_INVALID_ARG;
     return ValidateIoValue(type,value,len);
 }
@@ -1232,7 +1248,7 @@ esp_err_t agent_link_push_reading(const char* id,const void* value,size_t len) {
     if(len>PayloadBudget()) return ESP_ERR_INVALID_SIZE;
     int idx=0; const esp_err_t valid=ValidateReading(id,value,len,idx);
     if(valid!=ESP_OK) return valid;
-    auto& e=s_io[idx];
+    auto& e=IoEntries()[idx];
     const size_t id_len=BoundedLength(id,63);
     if(len>UINT16_MAX-id_len-2 || id_len+2+len>PayloadBudget()) return ESP_ERR_INVALID_SIZE;
     CacheReading(e,value,len);
@@ -1246,7 +1262,7 @@ esp_err_t agent_link_update_reading(const char* id,const void* value,size_t len)
     if(len>AGENT_LINK_READING_CACHE_BYTES) return ESP_ERR_INVALID_SIZE;
     int idx=0; const esp_err_t valid=ValidateReading(id,value,len,idx);
     if(valid!=ESP_OK) return valid;
-    auto& e=s_io[idx];
+    auto& e=IoEntries()[idx];
     if(e.pending) ++s_stats.reading_coalesces;
     CacheReading(e,value,len); e.pending=true;
     return ESP_OK;
@@ -1270,7 +1286,7 @@ esp_err_t agent_link_notify_manifest_changed(void) {
         static_cast<uint8_t>(s_manifest_rev >> 16),
         static_cast<uint8_t>(s_manifest_rev >> 24),
     };
-    if (Ready()) {
+    if (ControlReady()) {
         const esp_err_t result = SendReliableServiceEvent(0x1A,p,sizeof(p));
         (void)result;
     }

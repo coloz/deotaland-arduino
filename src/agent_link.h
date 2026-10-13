@@ -164,35 +164,11 @@ typedef void (*agent_state_cb_t)(agent_state_t state, void* ctx);
  * @brief Transport backend selection
  *
  * Default is BLE (0). CUSTOM injects a board-specific implementation.
- * WiFi supports provisioning and platform activation/authentication/heartbeat;
- * the upstream WiFi runtime data plane is not implemented yet.
  */
 typedef enum {
     AGENT_TRANSPORT_BLE  = 0,  // GATT control/VOICE, optional CoC AUDIO/IMAGE/TTS/OTA
-    AGENT_TRANSPORT_WIFI = 1,  // Cloud online = CONNECTED, never READY until a data plane exists
     AGENT_TRANSPORT_CUSTOM = 3, // Injected backend; no ESP32 dependency
-    AGENT_TRANSPORT_BOTH = 2,  // Reserved; init returns NOT_SUPPORTED
 } agent_transport_kind_t;
-
-/**
- * @brief WiFi transport configuration
- *
- * Used by WIFI provisioning. May be NULL to load saved credentials or start a SoftAP.
- */
-typedef struct agent_wifi_config_s {
-    const char* ssid;      // WiFi SSID
-    const char* password;  // WiFi password (can be NULL for open networks)
-} agent_wifi_config_t;
-
-/** Platform configuration. Strings and structure are copied by init().
- * WiFi requires a platform for cloud access; NULL retains station-only provisioning.
- * base_url must be an HTTPS origin, without a trailing slash (max 95 bytes).
- */
-typedef struct agent_platform_s {
-    const char* base_url;
-    int product_id;
-    const char* chip_type;
-} agent_platform_t;
 
 typedef enum {
     AGENT_LINK_PHASE_IDLE = 0,
@@ -202,8 +178,6 @@ typedef enum {
     AGENT_LINK_PHASE_BLOCKED,
     AGENT_LINK_PHASE_CONNECTED,
     AGENT_LINK_PHASE_READY,
-    /** Router assigned an IP; no platform configured. Not an Agent data session. */
-    AGENT_LINK_PHASE_NETWORK_READY,
 } agent_link_phase_t;
 
 typedef struct agent_link_status_s {
@@ -211,19 +185,10 @@ typedef struct agent_link_status_s {
     agent_transport_kind_t transport;
     char title[32];
     char hint[112];
-    char code[8];
-    uint32_t expires_s;
     int detail;
-    /** WiFi-only snapshot, independent of cloud activation and Agent readiness.
-     * Updated by poll(); false/empty for other transports and after disconnect.
-     * An IP proves local network access, not Internet/platform reachability.
-     */
-    bool wifi_connected;
-    bool wifi_portal_active;
-    char wifi_ip[16];
 } agent_link_status_t;
 
-/** Delivered by poll(), including for BLE/WiFi. Copy the snapshot if needed later.
+/** Delivered by poll(). Copy the snapshot if needed later.
  * Intermediate display updates may be coalesced; connection events remain separate.
  */
 typedef void (*agent_link_status_cb_t)(const agent_link_status_t* status, void* ctx);
@@ -234,13 +199,12 @@ typedef void (*agent_link_status_cb_t)(const agent_link_status_t* status, void* 
  * Passed to agent_link_init() to configure the device's connection.
  */
 typedef struct {
-    const char*              device_name; ///< BLE advertising name / platform display name (required)
+    const char*              device_name; ///< BLE advertising name (required)
     uint32_t                 caps;         ///< agent_cap_t bitmask (required)
     const agent_output_cb_t* output;       ///< Agent→Device callbacks (NULL for pure sensor devices)
     agent_state_cb_t         on_state;     ///< Connection state callback (can be NULL)
     void*                    state_ctx;    ///< Context passed to on_state
     agent_transport_kind_t   transport;    ///< Transport backend (default 0 = BLE)
-    const agent_wifi_config_t* wifi;        ///< WiFi config (when transport includes WIFI; can be NULL for later provisioning)
     const char*              manufacturer;  ///< Manufacturer (max 63 UTF-8 bytes); NULL → "Deotaland"
     /**
      * @brief Hardware model (max 39 UTF-8 bytes); NULL → device_name.
@@ -256,7 +220,6 @@ typedef struct {
     agent_transport_t* custom_transport; ///< Required for CUSTOM, borrowed for the lifetime.
     bool enable_ota; ///< Opt-in ESP32 OTA; requires a CoC-capable BLE backend and OTA partitions.
     const uint8_t* device_id; ///< Optional stable 16-byte ID, copied. Supply for custom hardware.
-    const agent_platform_t* platform; ///< Copied, including strings; ignored by BLE.
     agent_link_status_cb_t on_status;
     void* status_ctx;
 } agent_link_config_t;
@@ -268,7 +231,7 @@ typedef struct {
 /** Initialize the agent link module */
 esp_err_t     agent_link_init(const agent_link_config_t* cfg);
 
-/** Start the connection (BLE advertising or WiFi connection) */
+/** Start the connection (BLE advertising or the custom backend) */
 esp_err_t     agent_link_start(void);
 /** True after asynchronous backend teardown and any cancelled OTA flash work
  * finish, so begin may be retried. An idle preallocated OTA task is allowed. */
@@ -284,14 +247,13 @@ agent_state_t agent_link_state(void);
  * other platforms follow the library's single-loop-thread contract. */
 void agent_link_get_status(agent_link_status_t* out);
 /** Canonical UUID string; NULL until a persisted or explicitly supplied ID exists.
- * BLE and WiFi use the same ID. The returned string lasts until reconfiguration.
+ * The returned string lasts until reconfiguration.
  * New ESP32 identities are minted only after RF startup and successful NVS storage.
  */
 const char* agent_link_device_id(void);
-/** Forget BLE bonds / WiFi platform credential, keeping UUID and WiFi credentials.
+/** Forget BLE bonds, keeping the device UUID.
  * Call from the loop after start. BLE writes NVS synchronously (like lifecycle
- * calls); WiFi erasure is queued and failures appear in status.
- * CUSTOM returns NOT_SUPPORTED. A bound device may require console unbinding.
+ * calls). CUSTOM returns NOT_SUPPORTED.
  */
 esp_err_t agent_link_forget(void);
 
@@ -386,8 +348,7 @@ esp_err_t agent_link_push_event(agent_event_t type, const uint8_t* data, size_t 
  *         ESP_ERR_INVALID_ARG if utf8 is NULL or empty.
  *         ESP_ERR_INVALID_SIZE if it exceeds the current single-frame budget: BLE = negotiated
  *         ATT_MTU − 9, capped at 480B (≈238B at the recommended MTU 247; only ≈14B if the App
- *         has not yet performed MTU exchange). CUSTOM uses its control MTU;
- *         the built-in WiFi backend has no prompt data channel.
+ *         has not yet performed MTU exchange). CUSTOM uses its control MTU.
  * @note a dropped frame is not resent.
  */
 esp_err_t agent_link_push_prompt(const char* utf8);

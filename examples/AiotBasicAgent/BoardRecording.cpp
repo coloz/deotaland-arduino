@@ -33,7 +33,7 @@ constexpr const char* kMount = "/aiotsd";
 constexpr const char* kRecords = "/aiotsd/records";
 constexpr const char* kMessages = "/aiotsd/records/messages";
 constexpr size_t kWriteBytes = 64 * 1024, kReadBytes = 16 * 1024;
-constexpr size_t kChunkBytes = 4096, kEntries = 128, kPathBytes = 320;
+constexpr size_t kChunkBytes = 4096, kInitialEntries = 128, kPathBytes = 320;
 constexpr uint32_t kRate = 16000, kBytesPerSecond = kRate * 2;
 constexpr bool kStoreAdpcm = AIOT_SD_ADPCM != 0;
 constexpr uint32_t kHeaderBytes = kStoreAdpcm ? 60 : 44;
@@ -191,7 +191,12 @@ void adpcmWavHeader(uint8_t* header, uint32_t bytes, uint32_t samples) {
 struct BoardRecording::Impl {
     enum class Mode { Idle, Record, Reader, Scan };
     struct Entry { char name[256]; uint32_t bytes, mtime, durationMs; };
-    struct Cache { Entry entries[2][kEntries]; uint16_t count[2]; bool truncated; };
+    struct Cache {
+        Entry* entries[2];
+        uint16_t count[2], capacity[2];
+        bool truncated;
+        esp_err_t listError;
+    };
     SemaphoreHandle_t mutex = nullptr, begun = nullptr, finished = nullptr;
     TaskHandle_t task = nullptr;
     sdmmc_card_t* card = nullptr;
@@ -225,6 +230,35 @@ struct BoardRecording::Impl {
     uint8_t decoded[recording_codec::kPcmBytesPerBlock] = {};
     size_t decodedOffset = 0, decodedSize = 0;
     bool writeFailed = false;
+
+    // Grow only the inactive snapshot on the filesystem worker. The wire uses
+    // uint16 offsets/counts; memory failure is an error, never a successful
+    // truncated directory that hides the 129th and later recordings.
+    bool growEntries(Cache& out, unsigned scope) {
+        if (out.count[scope] < out.capacity[scope]) return true;
+        if (out.capacity[scope] == UINT16_MAX) {
+            out.listError = ESP_ERR_INVALID_SIZE;
+            return false;
+        }
+        const size_t capacity = std::min<size_t>(UINT16_MAX,
+            out.capacity[scope] ? size_t(out.capacity[scope]) * 2 : kInitialEntries);
+        Entry* entries = static_cast<Entry*>(heap_caps_malloc(capacity * sizeof(Entry),
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!entries) { out.listError = ESP_ERR_NO_MEM; return false; }
+        if (out.count[scope]) memcpy(entries, out.entries[scope], out.count[scope] * sizeof(Entry));
+        heap_caps_free(out.entries[scope]);
+        out.entries[scope] = entries;
+        out.capacity[scope] = static_cast<uint16_t>(capacity);
+        return true;
+    }
+    void releaseCaches() {
+        for (auto& snapshot : cache) {
+            if (!snapshot) continue;
+            for (auto& entries : snapshot->entries) heap_caps_free(entries);
+            heap_caps_free(snapshot);
+            snapshot = nullptr;
+        }
+    }
 
     bool lock(TickType_t ticks = 0) { return xSemaphoreTake(mutex, ticks) == pdTRUE; }
     void unlock() { xSemaphoreGive(mutex); }
@@ -269,7 +303,7 @@ struct BoardRecording::Impl {
     void scan(bool selectExisting) {
         const unsigned next = 1 - activeCache;
         Cache& out = *cache[next];
-        out.count[0] = out.count[1] = 0; out.truncated = false;
+        out.count[0] = out.count[1] = 0; out.truncated = false; out.listError = ESP_OK;
         uint32_t newestTime = 0;
         uint32_t newestSequence = 0;
         bool newestIsOwn = false;
@@ -277,8 +311,16 @@ struct BoardRecording::Impl {
         for (unsigned scope = 0; scope < 2; ++scope) {
             const char* directory = scope ? kMessages : kRecords;
             DIR* dir = opendir(directory);
-            if (!dir) { error.store(ESP_FAIL); continue; }
-            while (dirent* entry = readdir(dir)) {
+            if (!dir) { out.listError = ESP_FAIL; continue; }
+            for (;;) {
+                // Other filesystem calls below can change errno. Clear it
+                // before each readdir to distinguish EOF from a failed scan.
+                errno = 0;
+                dirent* entry = readdir(dir);
+                if (!entry) {
+                    if (errno) { out.listError = ESP_FAIL; out.truncated = true; }
+                    break;
+                }
                 if (entry->d_name[0] == '.' || !endsWithWav(entry->d_name)) continue;
                 uint32_t sequence = 0;
                 const bool own = !scope && ownSequence(entry->d_name, sequence);
@@ -289,8 +331,13 @@ struct BoardRecording::Impl {
                     out.truncated = true; continue;
                 }
                 struct stat st = {};
-                if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
-                    uint64_t(st.st_size) > UINT32_MAX) continue;
+                if (stat(path, &st) != 0) {
+                    // A file removed during the scan is harmless. An I/O
+                    // error must not be returned as a complete directory.
+                    if (errno != ENOENT) { out.listError = ESP_FAIL; out.truncated = true; }
+                    continue;
+                }
+                if (!S_ISREG(st.st_mode) || st.st_size < 0 || uint64_t(st.st_size) > UINT32_MAX) continue;
                 WavInfo wav;
                 const int fd = open(path, O_RDONLY);
                 const bool valid = fd >= 0 && inspectWav(fd, static_cast<uint32_t>(st.st_size), wav);
@@ -306,20 +353,24 @@ struct BoardRecording::Impl {
                     snprintf(newest, sizeof(newest), "%s", path); newestTime = mtime;
                     newestIsOwn = own; newestSequence = sequence;
                 }
-                if (out.count[scope] == kEntries) { out.truncated = true; continue; }
+                if (out.listError != ESP_OK || !growEntries(out, scope)) {
+                    out.truncated = true; continue;
+                }
                 Entry& dst = out.entries[scope][out.count[scope]++];
                 memcpy(dst.name, relative, strlen(relative) + 1);
                 dst.bytes = static_cast<uint32_t>(st.st_size); dst.mtime = mtime;
                 dst.durationMs = valid ? wav.durationMs : 0;
             }
             closedir(dir);
-            std::sort(out.entries[scope], out.entries[scope] + out.count[scope],
-                      [](const Entry& a, const Entry& b) { return strcmp(a.name, b.name) < 0; });
+            if (out.count[scope] > 1)
+                std::sort(out.entries[scope], out.entries[scope] + out.count[scope],
+                          [](const Entry& a, const Entry& b) { return strcmp(a.name, b.name) < 0; });
         }
         lock(portMAX_DELAY);
         activeCache = next;
         if (selectExisting && newest[0]) snprintf(latestWorker, sizeof(latestWorker), "%s", newest);
         truncated.store(out.truncated);
+        if (out.listError != ESP_OK) error.store(out.listError);
         unlock();
     }
     esp_err_t mount() {
@@ -566,7 +617,7 @@ BoardRecording::~BoardRecording() {
     if (state.begun) vSemaphoreDelete(state.begun);
     if (state.finished) vSemaphoreDelete(state.finished);
     heap_caps_free(state.writeRing); heap_caps_free(state.readRing); heap_caps_free(state.chunk);
-    heap_caps_free(state.cache[0]); heap_caps_free(state.cache[1]);
+    state.releaseCaches();
     delete impl_;
 }
 
@@ -590,7 +641,7 @@ esp_err_t BoardRecording::begin() {
         heap_caps_free(state.writeRing); state.writeRing = nullptr;
         heap_caps_free(state.readRing); state.readRing = nullptr;
         heap_caps_free(state.chunk); state.chunk = nullptr;
-        for (auto& cache : state.cache) { heap_caps_free(cache); cache = nullptr; }
+        state.releaseCaches();
         if (state.mutex) { vSemaphoreDelete(state.mutex); state.mutex = nullptr; }
         if (state.begun) { vSemaphoreDelete(state.begun); state.begun = nullptr; }
         if (state.finished) { vSemaphoreDelete(state.finished); state.finished = nullptr; }
@@ -687,6 +738,7 @@ esp_err_t BoardRecording::handleList(const uint8_t* request, size_t length,
     Impl& state = *impl_;
     if (!state.lock()) return ESP_ERR_TIMEOUT;
     const Impl::Cache& cache = *state.cache[state.activeCache];
+    if (cache.listError != ESP_OK) { state.unlock(); return cache.listError; }
     const uint16_t total = cache.count[scope];
     uint16_t position = std::min(offset, total), count = 0;
     size_t used = 2;

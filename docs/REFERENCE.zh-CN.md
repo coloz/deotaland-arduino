@@ -1,12 +1,12 @@
 # API 与进阶参考
 
-适用库版本：**0.8.1**；核对日期：2026-10-11。本文对应当前源码：包含随库编译的 NimBLE CoC、相机拍照与分块图片上传、类型化读数、Wi-Fi 状态，以及流、播放、OTA 和自定义传输约定。
+适用库版本：**0.9.3**；核对日期：2026-10-13。本文对应当前源码：包含随库编译的 NimBLE CoC、相机拍照与分块图片上传、类型化读数、BLE 连接状态，以及流、播放、OTA 和自定义传输约定。
 
 **升级后必须在 loop() 中调用 Deotaland.poll()。** 硬件回调在这个调用线程执行。通用库不绑定屏幕、麦克风、相机或传感器引脚；应用通过回调和 I/O 端点接入硬件。CameraSnapshot 示例已提供真实 ESP32 相机驱动接入，默认原版 GC2145 引脚。
 
 ## 安装与入门
 
-安装和逐步练习见 [中文指南](BEGINNER-GUIDE.zh-CN.md)，完整程序见 [示例索引](../examples/README.zh-CN.md)。BLE 从 BasicBLE 开始；Wi-Fi 可直接从 BasicWiFi 或 WiFiProvisioning 开始。常见错误与处理见 [入门排查表](BEGINNER-GUIDE.zh-CN.md#troubleshooting)。
+安装和逐步练习见 [中文指南](BEGINNER-GUIDE.zh-CN.md)，完整程序见 [示例索引](../examples/README.zh-CN.md)。从 BasicBLE 开始。常见错误与处理见 [入门排查表](BEGINNER-GUIDE.zh-CN.md#troubleshooting)。
 
 BLE 物理连接先进入 CONNECTED，订阅事件通知 0xFFC4 后才 READY。连接状态回调由 poll 派发；断连会立即使 isReady 和旧会话失效，避免快速重连时发送上一连接的数据。所有应用都应检查 begin 和发送 API 的返回值；推荐从 BasicBLE 完整示例开始。READY 只代表控制通道，AUDIO/IMAGE 还需要对应 CoC 通道就绪。
 
@@ -16,11 +16,12 @@ BLE 物理连接先进入 CONNECTED，订阅事件通知 0xFFC4 后才 READY。�
 | --- | --- |
 | 协议、清单、I/O、流会话、PCM/ADPCM | C++11 标准库，不依赖 ESP-IDF、Arduino 引脚或 RTOS |
 | 内置 BLE | Arduino-ESP32 3.x、有 BLE 控制器的芯片；随库编译 NimBLE-Arduino，CoC 默认 2；无 BLE 时返回不支持 |
-| Wi-Fi 云端 | ESP32 Wi-Fi；STA/SoftAP 配网、HTTPS 激活绑定、鉴权、心跳；尚无控制/媒体数据通道 |
 | 自定义传输 | AGENT_TRANSPORT_CUSTOM；STM32 等具有标准库和足够 RAM 的 32 位 Arduino 硬件 |
 | OTA | 显式启用的 ESP32 后端，需要 CoC 和 OTA 分区布局 |
 
 元数据声明 ESP32 和 STM32。其他平台可复用核心并提供适配器，但没有声称真机验证。AVR/UNO 的内存和标准库条件不适合此实现；修改 architectures 不能替代芯片 BLE 驱动。
+
+当前编译基线为 Arduino-ESP32 3.3.12，其预编译 SDK 为 ESP-IDF 5.5.5；Core 版本与 ESP-IDF 版本是两个不同的编号。
 
 ## 非阻塞约定
 
@@ -29,24 +30,23 @@ BLE 物理连接先进入 CONNECTED，订阅事件通知 0xFFC4 后才 READY。�
 - RX 固定容量：默认 16 槽，每个最大 1024 字节；媒体最多占 12 槽，为控制和状态各预留两个槽。入队复制数据。stats() 提供拒收数、队列峰值、发送重试、背压、清单进度，以及 `poll_last_us / poll_max_us / poll_budget_exhaustions`。
 - 发送 ESP_OK 表示已入队，不保证对端收到。ESP_ERR_NO_MEM / ESP_ERR_TIMEOUT 时保留原数据，在后续循环重试。文件和图片不能跳过失败的数据块。
 - BLE 重试及驱动收尾由后台任务处理。自定义 send_ctrl / send_stream / poll 也必须快速返回，不调用阻塞连接或 flush。
-- begin / end 涉及平台驱动，不承诺硬实时耗时。end 发起后台收尾，先等待 `canBegin()` 再次为 true，再调用 begin。Wi-Fi 若已被其他库初始化，会拒绝接管驱动；同一驱动应由应用选择一个管理者。
+- begin / end 涉及平台驱动，不承诺硬实时耗时。end 发起后台收尾，先等待 `canBegin()` 再次为 true，再调用 begin。
 - 用户回调仅由 poll 串行派发，不能等待、递归调用 poll 或调用生命周期方法。持续播放、显示及电机动作由应用状态机执行。大量串口日志本身也可能阻塞。
 - 公共业务 API 在同一个 loop 线程调用，不从 ISR 调用。ESP32 RX 入口支持 BLE 线程入队；非 ESP32 自定义后端应在其 poll 中提交接收事件。
 
-常规事件、读数、命令解析/应答和清单热路径不逐包分配堆内存；BLE 控制队列固定 16 槽，为应答、流控和结束等重要消息预留两个槽，保持 FIFO 顺序。VOICE/AUDIO/IMAGE 分别使用 16/16/32 KiB 媒体环和各 6 KiB 工作任务栈，可在 begin 后通过 `prepareStreams(1u << AGENT_STREAM_VOICE)` 提前创建；关闭流后资源复用，end 后台收尾时释放。未预热仍在首次打开时创建。建议每轮 writeStream 不超过 512 字节，NO_MEM/TIMEOUT 原块稍后重试；INVALID_SIZE 时检查块容量及总长度，只有块容量超限才拆小；VOICE 必须按 PCM16 偶数字节写入。初始配置、云端、OTA 和底层无线栈仍可能分配内存。
+常规 BLE 事件、读数、命令解析/应答和清单热路径不逐包分配堆内存；BLE 控制队列固定 16 槽，为应答、流控和结束等重要消息预留两个槽，保持 FIFO 顺序。VOICE/AUDIO/IMAGE 分别使用 16/16/32 KiB 媒体环和各 6 KiB 工作任务栈，可在 begin 后通过 `prepareStreams(1u << AGENT_STREAM_VOICE)` 提前创建；关闭流后资源复用，end 后台收尾时释放。未预热仍在首次打开时创建。建议每轮 writeStream 不超过 512 字节，NO_MEM/TIMEOUT 原块稍后重试；INVALID_SIZE 时检查块容量及总长度，只有块容量超限才拆小；VOICE 必须按 PCM16 偶数字节写入。初始配置、云端 JSON、OTA 和底层无线栈仍可能分配内存。
 
 清单默认上限 8192 字节，溢出不发送残缺 JSON，stats().last_error 为 INVALID_SIZE。可用 AGENT_LINK_MANIFEST_BYTES、AGENT_LINK_MANIFEST_STEP_BYTES、AGENT_LINK_RX_SLOTS / AGENT_LINK_RX_BYTES、AGENT_LINK_READING_CACHE_BYTES 等全局编译参数调整；资源和兼容性说明见性能文档。所有参数须对库的源文件统一生效，仅在 ino 中定义不能改变库的编译参数。
 
-自定义传输可以通过全局编译参数 `AGENT_LINK_DISABLE_BLE`、`AGENT_LINK_DISABLE_WIFI`、`AGENT_LINK_DISABLE_CLOUD`、`AGENT_LINK_DISABLE_OTA` 排除不用的后端及其驱动依赖。例如 Arduino CLI 加上 `--build-property "compiler.cpp.extra_flags=-DAGENT_LINK_DISABLE_BLE -DAGENT_LINK_DISABLE_WIFI -DAGENT_LINK_DISABLE_OTA"`。默认不关闭任何可用后端；无 Wi-Fi 的芯片自动使用不支持的桩实现。
+自定义传输可以通过全局编译参数 `AGENT_LINK_DISABLE_BLE`、`AGENT_LINK_DISABLE_OTA` 排除不用的后端及其驱动依赖。例如 Arduino CLI 加上 `--build-property "compiler.cpp.extra_flags=-DAGENT_LINK_DISABLE_BLE -DAGENT_LINK_DISABLE_OTA"`。默认启用芯片支持的 BLE 后端；不支持 BLE 的芯片会返回 NOT_SUPPORTED。
 
 <a id="api-overview"></a>
-## API 概览（0.8.1）
+## API 概览（0.9.3）
 
 | 能力 | API / 状态 |
 | --- | --- |
 | 生命周期 | begin, poll, end, reset, canBegin, state, isReady, stats |
-| 连接进度与身份 | status / on_status、deviceId、forget；SETUP / CONNECTING / PAIRING / BLOCKED / NETWORK_READY / CONNECTED / READY 等显示阶段 |
-| Wi-Fi 网络快照 | status().wifi_connected、wifi_portal_active、wifi_ip；与平台鉴权及 isReady 独立 |
+| 连接进度与身份 | status / on_status、deviceId、forget；SETUP / CONNECTING / PAIRING / BLOCKED / CONNECTED / READY 等显示阶段 |
 | 自描述硬件 | registerIo, pushReading, updateReading, notifyManifestChanged；GetReading / SetReadingConfig |
 | 类型化缓存读数 | updateBool, updateInt32, updateUInt16, updateFloat, updateText；检查已注册端点类型 |
 | 事件和提示词 | pushEvent, pushPrompt, reportBattery；maxPromptBytes 查询当前单包容量 |
@@ -83,7 +83,7 @@ setPlaybackBufferMs(ms) 声明真实播放缓冲容量，默认 400ms，支持�
 
 `errorName()`/`errorHint()` 解释 API 返回值；`stateName()` 解释 `agent_state_t`，不要传入 `status().phase`。`isRetryable()` 仅将 NO_MEM/TIMEOUT 视为发送拥塞候选，应在后续 loop 限频重试；初始化或资源预热时 NO_MEM 可能需要减少内存占用。`stats().last_error` 是最近记录的历史错误，成功不会自动清零，也不覆盖每个公共 API 的参数错误。动态注册端点会自动使清单更新；原地修改已注册描述符后才需显式调用 `notifyManifestChanged()`。
 
-内置 Wi-Fi 支持联网、配网和云端激活/绑定/鉴权/心跳，**仍没有云端控制/媒体通道**。云端在线为 CONNECTED，isReady() 保持 false。BOTH 返回 ESP_ERR_NOT_SUPPORTED。内置 VIDEO、FILE 和 selectAgent 也未实现，自定义后端可支持通用流类型。
+内置传输仅支持 BLE。VIDEO、FILE 和 selectAgent 未实现，自定义后端可支持通用流类型。
 
 0.8.0 在普通 Arduino 构建中随库编译 NimBLE-Arduino 2.5.1，统一启用两个 CoC 通道。AUDIO、IMAGE、TTS 和显式启用的 OTA 使用这套栈，官方 Core 的预编译 CoC=0 不再限制这些业务。两个通道是同时连接上限；OTA 与 TTS 共用 PSM 0x0081。App 仍须打开相应通道。配置与协议见 [CoC 说明](BLE-COC.zh-CN.md)。GATT 控制和 VOICE 不依赖 CoC。
 
@@ -95,50 +95,19 @@ sendStream 适合整块一次入队的小对象，已有同类型流时返回状
 
 `DeotalandImageUpload` 适合大于排队缓存的完整照片。`start(opts, data, bytes, now_ms, timeout_ms=30000)` 验证元数据并借用缓冲区，不复制整图；在 `loop()` 中调用 `poll(millis())`，每次最多执行一个流操作，写入块不超过 512 字节。每块入队失败时保留偏移重试；超时、取消和连接代际变化会终止任务。`busy()` 为 false 后可以释放图像；Completed 代表本地接受。`cancel()` 后继续 poll 处理取消 END；永久关闭错误可能保留核心流，此时需等断线后建立新会话，不能覆盖旧流。完整接口及真实相机接入见[图片上传指南](IMAGE-UPLOAD.zh-CN.md)。
 
-## Wi-Fi 网络状态与云端配置
+## BLE 状态与设备身份
 
-`agent_wifi_config_t` 只包含 ssid / password；早期接口的 endpoint / token 已移除。平台信息使用 `config.platform`，应用不提供 auth_key：它由激活绑定流程获取并保存。Wi-Fi 配置、平台对象及字符串在 begin 时复制。
+`status()` / `on_status` 提供连接阶段、传输类型、title、hint 和 detail。回调由 `poll()` 派发，中间更新可合并；`READY` 表示事件通道已订阅，媒体还需各自通道就绪。Wi-Fi 配置、平台配置、网络快照和激活码字段已移除。
 
-非空的 `config.wifi->ssid` 每次启动优先于 NVS 中保存的网络；未预设时才加载 NVS，无凭据时打开配网门户。通过门户更换网络后，若草图仍提供旧凭据，下次启动仍优先尝试旧网络。开放网络密码填空串。直接填写凭据见 [BasicWiFi](../examples/BasicWiFi/BasicWiFi.ino)，让用户管理网络见 [WiFiProvisioning](../examples/WiFiProvisioning/WiFiProvisioning.ino)。预设凭据直接联网不等于已写入 NVS。
+所有传输统一限制 model 最多 39、firmware_rev 最多 31、manufacturer 最多 63 UTF-8 字节，超长 begin 返回 INVALID_SIZE；未指定 model 时采用 device_name，因此也受 39 字节限制。
 
-~~~cpp
-agent_platform_t platform = {"https://your-platform.example", 123, "esp32-s3"};
-agent_link_config_t config = {};
-config.device_name = "MyDevice";
-config.firmware_rev = "1.0.0";  // 设备实际固件版本，独立于库版本
-config.transport = AGENT_TRANSPORT_WIFI;
-config.platform = &platform;
-config.on_status = [](const agent_link_status_t* s, void*) {
-  // 由 poll() 派发；PAIRING 时显示 s->code 和 s->expires_s。
-};
-// 在 setup() 中检查 Deotaland.begin(config) 的返回值，在 loop() 中持续 poll()。
-~~~
+`deviceId()` 返回标准 UUID 字符串。ESP32 在 BLE RF 启动后首次生成并持久化于 `agent_link/dev_uuid`，保存失败不使用临时身份；已有 BLE UUID 保持不变。`forget()` 同步清除 BLE 配对记录并保留 UUID。CUSTOM 暂无统一的忘记绑定操作。请在 loop 中调用，避免从回调调用。
 
-base_url 使用 HTTPS 平台根地址，无尾斜线（最多 95 字节）；product_id 必须为正；chip_type 非空且最多 31 字节。所有传输统一限制 model 最多 39、firmware_rev 最多 31、manufacturer 最多 63 字节，超长 begin 返回 INVALID_SIZE；未指定 model 时采用 device_name，因此也受 39 字节限制。上面的域名和产品 ID 只是格式示意，需替换为实际平台参数；完整示例见 [CloudActivation](../examples/CloudActivation/CloudActivation.ino)。
+完整 BLE 固件和 OTA 需要足够的应用分区；验证使用 `esp32:esp32:esp32s3:PartitionScheme=min_spiffs`，保留双 OTA 槽。按最终固件大小和实际 Flash 容量选择分区。
 
-没有平台配置时仍能独立联网和配网。0.6.1 的 `agent_link_status_t` 新增以下 Wi-Fi 字段，由 poll 更新：
+0.8.2 起，ESP32 的 I/O registry、manifest 和 BLE 控制发送队列在首次使用/启动时优先分配 PSRAM，不存在或不足时回退内部 RAM；两者均不足时，注册或启动返回 `ESP_ERR_NO_MEM`。不在全局构造阶段申请 PSRAM。`stop` 保留 registry 与已准备的存储，`deinit` 在停止并解绑后释放 registry/manifest；BLE 控制队列常驻保留供后续启动复用。公开业务 API 仍须在同一应用线程调用，不得从 ISR 调用；RX critical section、DMA、Flash 写缓冲和任务栈不因本优化迁到 PSRAM。非 ESP32 便携构建保留固定静态存储。板上水位、OTA 预热与未验收项目见[硬件实测记录](HARDWARE-VALIDATION.zh-CN.md)。
 
-| 字段/阶段 | 含义 |
-| --- | --- |
-| wifi_connected / wifi_ip | 已获取路由器分配的 IPv4 地址；不保证公网、TLS 或平台可达 |
-| wifi_portal_active | 配网门户是否活动；成功暂留或凭据保存失败时，可与 wifi_connected 同时为 true |
-| SETUP / Set up WiFi | 门户活动时优先显示，hint 包含设备热点名称 |
-| CONNECTING / Joining WiFi | 门户未开启，尚未获取 IP |
-| NETWORK_READY / WiFi connected | 门户关闭、有 IP、未配置平台；不是 Agent 数据会话 |
-| CONNECTED / Platform online | 平台鉴权在线；Wi-Fi 的 isReady() 仍为 false |
-| BLOCKED / WiFi service failed | 后台服务失败，清除联网快照；按 hint/detail 排查 |
-
-断网、丢失 IP 或停止会清除地址；旧网络事件不能恢复过期 IP。平台错误也可能显示 BLOCKED，此时网络仍可保持连接，应分别查看上述字段。`detail` 可能是服务的 ESP 错误码或平台业务码，不能一律当成 ESP 错误解释。显式 end/reset 后快照清空；停止后的驱动清理错误看底层日志，`canBegin()` 反映是否可重新启动。内置 BLE 不填充 Wi-Fi 字段。新增显示阶段追加在枚举末尾，旧枚举值不变；状态结构增加字段，应用和库须一起重新编译。
-
-首次绑定流程：联网/配网 → 门户关闭 → claim-code → 显示激活码 → bind-status → NVS 保存 auth_key → auth → CONNECTED → 每 60 秒 heartbeat。已有有效平台凭据时直接鉴权。未绑定时约 3 秒查询一次绑定状态；绑定查询无响应时保留激活码并约 3 秒重查，其他网络失败通常退避 5 秒，平台拒绝通常退避 30 秒；接近过期时重新获取激活码。没有 Agent、已被其他账户绑定等情形通过 BLOCKED 显示。心跳失败后重新鉴权。HTTPS 使用 ESP32 Core 的 CA 证书包校验服务器。
-
-HTTP/TLS 在独立任务中执行。end() 后会等待正在执行的请求退出再释放资源，期间 begin() 返回 INVALID_STATE；等待在后台进行。on_status 由 poll() 派发，快速连续更新可合并。status() 返回最近生成的显示快照，不替代 state()/isReady() 的数据通道判断。
-
-配网凭据作为一个带版本的 NVS blob 提交，兼容旧 SSID/password 双键读取。连接成功但保存失败会保留门户并提示失败，后台间隔重试。Wi-Fi 与云端空闲任务等待事件或下一个业务截止时间，不再每 50ms 无条件轮询；进行中的 HTTP/TLS 请求仍需返回后才能收尾。
-
-deviceId() 返回标准 UUID 字符串。ESP32 首次启动无线后生成并持久化，保存失败不使用临时身份；既有 agent_link/dev_uuid 优先，只有旧 al_dev/sn 时会迁移。forget() 保留 UUID 和 Wi-Fi SSID/密码：BLE 同步清除配对记录（涉及 NVS 写入）；Wi-Fi 接受清除请求后由后台执行并重新激活。已绑定设备可能需要先在平台控制台解绑。CUSTOM 暂无统一的忘记绑定操作。请在 loop 中调用 forget，避免从回调调用。
-
-完整 ESP32 构建包含 TLS，建议至少 1.5MB 的应用分区；验证使用 `esp32:esp32:esp32s3:PartitionScheme=min_spiffs`，保留双 OTA 槽。BLE 产品可全局设置 `-DAGENT_LINK_DISABLE_CLOUD` 排除云端 HTTP/TLS，同时保留 Wi-Fi 配网；关闭 WIFI 也会排除云端。这些宏须作为库的编译参数传入。仍需按最终固件大小和 Flash 容量选择分区。
+BLE 连接时请求 15–30 ms 间隔、零从机延迟和 4 秒监督超时，最终值由中央设备决定；拒绝请求不会阻止控制通道进入 READY。VOICE 在控制 FIFO 或已取出的控制包等待提交时让出发送机会，避免持续音频抢占首个空闲 mbuf；原有 FIFO 顺序与 3 秒故障断连规则保留。VOICE 满包立即发送，短尾在 ring 中等待新数据最多 20 ms，END 立即刷新，减少跨调用边界的小通知。诊断构建可全局传入 `-DAGENT_LINK_BLE_LINK_DIAGNOSTICS=1` 查看实际间隔、DLE 和 PHY 事件；普通应用无需启用。请求参数或 DLE 支持不等于保证某个接收端能持续接收 32 KB/s PCM。
 
 ## 接入其他硬件
 
@@ -146,7 +115,7 @@ deviceId() 返回标准 UUID 字符串。ESP32 首次启动无线后生成并持
 2. 使用 agent_output_cb_t 实现文本、音频、灯、电机或私有命令。
 3. ESP32 使用内置 BLE；其他硬件提供 agent_transport_t，设置 config.transport=AGENT_TRANSPORT_CUSTOM 和 config.custom_transport。
 4. 后端 bind 保存接收回调，提交完整 Agent Link 帧。ctrl_mtu 返回**含 6 字节头的完整帧容量**；发送函数须在返回前复制或消费输入，不可留存临时指针。
-5. 自定义硬件提供稳定唯一的 config.device_id。名称、版本及 Wi-Fi 字符串在 init 时复制；传输实例须覆盖库的使用期。
+5. 自定义硬件提供稳定唯一的 config.device_id。名称和版本字符串在 init 时复制；传输实例须覆盖库的使用期。
 
 CustomTransport 给出固定队列、有限步进的 UART 控制适配器，格式为 [完整帧长度 LE16][Agent Link v1 帧]，需要电脑或联网设备上的桥接程序。官方 App 不直接识别此 UART 包装；示例未提供音视频传输。
 
@@ -188,14 +157,12 @@ Arduino 可直接使用 `Deotaland.setOtaCallback(cb)`、`otaStatus()`、`otaBus
 - CoCDiagnostics：业务流支持、连接状态及队列诊断。
 - CoCOtaUpdate：OTA 显式启用、预热、进度、取消及健康确认。
 - CustomTransport：没有 ESP-IDF 的 UART 适配器。
-- BasicWiFi：预设 SSID/密码连接路由器，通过库状态查看 IP、配网进度与后台错误。
-- WiFiProvisioning：独立 Wi-Fi 配网。
-- CloudActivation：平台配置、激活码、连接进度、设备 UUID 和忘记绑定。
+- AiotBasicAgent：ESP32-S3 AIOT-Basic 麦克风、扬声器、相机、屏幕、彩灯和可用时的 SD 录音。
 - LifecycleSelfTest / HardwareSelfTest：板端集成检查。
 
-以上共 21 个示例，打开入口和硬件替换点见 [完整索引](../examples/README.zh-CN.md)。语音示例默认产生合成 PCM，ImageStream 使用 2×2 测试图；CameraSnapshot 接入真实相机，麦克风和扬声器仍需自己的驱动。
+以上共 19 个示例，打开入口和硬件替换点见 [完整索引](../examples/README.zh-CN.md)。通用语音示例默认产生合成 PCM，ImageStream 使用 2×2 测试图；CameraSnapshot 接入真实相机，麦克风和扬声器需自己的驱动，AiotBasicAgent 则提供指定板卡的外设接入。
 
-Wi-Fi 控制/媒体业务通道仍未实现；相机板与配套 App 尚未完成实机联调。真实无线、CoC 收图、音视频和 OTA 需在目标硬件上检查，编译通过不替代实测。
+ESP32-S3 AIOT-Basic 与 RoRoLee Android 3.4.2 已确认一次 BLE 拍照请求、JPEG 接收和画面描述，见[硬件实测记录](HARDWARE-VALIDATION.zh-CN.md)。这次 JPEG 验收不覆盖 RAW、连续图片、其他板卡或手机，也不替代音频接收/ASR、TTS 声学播放和 OTA 升级的目标硬件验收。
 
 从源码仓库生成 Arduino 安装包可运行 `tools/package-library.ps1`，再用 `tools/check-library-package.py` 检查包结构、文档链接及私有头文件。完整命令见 [打包说明](../README.md#生成安装包)。这两个维护工具不装入安装 ZIP。
 

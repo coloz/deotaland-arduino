@@ -5,6 +5,7 @@
 #endif
 
 #if defined(ARDUINO_ARCH_ESP32) && CONFIG_IDF_TARGET_ESP32S3
+#include "BoardTasks.h"
 #include <atomic>
 #include <cstring>
 #include <new>
@@ -286,7 +287,10 @@ struct BoardDisplay::Impl {
 
 esp_err_t BoardDisplay::begin() {
   if (impl_) return ESP_ERR_INVALID_STATE;
-  auto* self = new (std::nothrow) Impl;
+  // The completion ISR accesses this context even when external memory is
+  // unavailable. Keep it internal independently of the worker stack policy.
+  void* storage = heap_caps_malloc(sizeof(Impl), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  auto* self = storage ? new (storage) Impl : nullptr;
   if (!self) return ESP_ERR_NO_MEM;
   bool busOwned = false;
   esp_err_t result = ESP_OK;
@@ -331,7 +335,7 @@ esp_err_t BoardDisplay::begin() {
   if (result == ESP_OK) result = esp_lcd_panel_disp_on_off(self->panel, true);
   if (result == ESP_OK) {
     self->online.store(true);
-    if (xTaskCreate(Impl::workerEntry, "aiot_lcd", 6144, self, 1, &self->worker) != pdPASS)
+    if (aiotCreateBackgroundTask(Impl::workerEntry, "aiot_lcd", 6144, self, 1, &self->worker) != pdPASS)
       result = ESP_ERR_NO_MEM;
   }
   if (result != ESP_OK) {
@@ -340,7 +344,8 @@ esp_err_t BoardDisplay::begin() {
     if (busOwned) spi_bus_free(kHost);
     if (self->queue) vQueueDelete(self->queue);
     heap_caps_free(self->stripe);
-    delete self;
+    self->~Impl();
+    heap_caps_free(self);
     return result;
   }
   impl_ = self;

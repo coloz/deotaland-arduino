@@ -22,11 +22,6 @@ constexpr const char* TAG = "agent_link.ident";
 constexpr const char* kNs      = "agent_link";
 constexpr const char* kKeyUuid = "dev_uuid";
 
-// Legacy location: an early WiFi build stored its own string identity here. dev_identity_load()
-// migrates it into the canonical key and erases it. Remove once no device carries it.
-constexpr const char* kLegacyNs    = "al_dev";
-constexpr const char* kLegacyKeySn = "sn";
-
 #if defined(ARDUINO_ARCH_ESP32)
 std::mutex s_mtx;
 struct Guard { std::lock_guard<std::mutex> lock; Guard(): lock(s_mtx) {} };
@@ -46,31 +41,6 @@ void Format(const uint8_t b[16], char* out) {
 }
 
 #if defined(ARDUINO_ARCH_ESP32)
-int HexVal(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
-
-// Accepts exactly 8-4-4-4-12 hex digits.
-bool Parse(const char* s, uint8_t out[16]) {
-    if (!s || strlen(s) != 36) return false;
-    int n = 0;
-    for (int i = 0; i < 36; ) {
-        if (i == 8 || i == 13 || i == 18 || i == 23) {
-            if (s[i] != '-') return false;
-            ++i;
-            continue;
-        }
-        const int hi = HexVal(s[i]), lo = HexVal(s[i + 1]);
-        if (hi < 0 || lo < 0) return false;
-        out[n++] = static_cast<uint8_t>((hi << 4) | lo);
-        i += 2;
-    }
-    return n == 16;
-}
-
 esp_err_t ReadCanonical(uint8_t out[16]) {
     nvs_handle_t h;
     esp_err_t result = nvs_open(kNs,NVS_READONLY,&h);
@@ -89,23 +59,6 @@ esp_err_t WriteCanonical(const uint8_t b[16]) {
     if (r == ESP_OK) r = nvs_commit(h);
     nvs_close(h);
     return r;
-}
-
-esp_err_t ReadLegacy(uint8_t out[16], char* raw, size_t cap) {
-    nvs_handle_t h;
-    esp_err_t result = nvs_open(kLegacyNs,NVS_READONLY,&h);
-    if (result != ESP_OK) return result;
-    size_t len = cap;
-    result = nvs_get_str(h,kLegacyKeySn,raw,&len);
-    nvs_close(h);
-    return result == ESP_OK && !Parse(raw,out) ? ESP_ERR_INVALID_ARG : result;
-}
-
-void EraseLegacy() {
-    nvs_handle_t h;
-    if (nvs_open(kLegacyNs, NVS_READWRITE, &h) != ESP_OK) return;
-    if (nvs_erase_key(h, kLegacyKeySn) == ESP_OK) (void)nvs_commit(h);
-    nvs_close(h);
 }
 
 #endif
@@ -134,40 +87,13 @@ esp_err_t dev_identity_load(bool allow_mint) {
         return r;
     }
 
-    uint8_t canon[16] = {}, legacy[16] = {};
-    char    legacy_raw[40] = {};
+    uint8_t canon[16] = {};
     const esp_err_t canonical_result = ReadCanonical(canon);
     if (canonical_result != ESP_OK && canonical_result != ESP_ERR_NVS_NOT_FOUND) return canonical_result;
     const bool have_canon = canonical_result == ESP_OK;
-    const esp_err_t legacy_result = ReadLegacy(legacy,legacy_raw,sizeof(legacy_raw));
-    if (!have_canon && legacy_result != ESP_OK && legacy_result != ESP_ERR_NVS_NOT_FOUND) return legacy_result;
-    const bool have_legacy = legacy_result == ESP_OK;
-
     if (have_canon) {
         Take(canon);
-        if (have_legacy) {
-            if (memcmp(canon, legacy, 16) != 0) {
-                // Keep the canonical one; it is the identity the App already knows.
-                ESP_LOGW(TAG, "two identities on this unit: keeping %s, dropping the WiFi-only %s. "
-                              "The platform's record under the second one is now orphaned — "
-                              "unbind it in the console.", s_sn, legacy_raw);
-            }
-            EraseLegacy();
-        }
         ESP_LOGI(TAG, "device identity %s", s_sn);
-        return ESP_OK;
-    }
-
-    if (have_legacy) {
-        // Only the legacy identity exists: adopt it, so the platform keeps its existing record.
-        r = WriteCanonical(legacy);
-        if (r != ESP_OK) {
-            ESP_LOGE(TAG, "could not adopt %s as the device identity: %s", legacy_raw, esp_err_to_name(r));
-            return r;
-        }
-        Take(legacy);
-        EraseLegacy();
-        ESP_LOGI(TAG, "device identity %s (adopted from the WiFi channel)", s_sn);
         return ESP_OK;
     }
 

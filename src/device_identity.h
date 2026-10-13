@@ -1,11 +1,10 @@
 #pragma once
-// Device identity: one UUIDv4 shared by both transports. BLE sends its 16 bytes in the 0x01
-// RequestDeviceInfo response; WiFi sends the 36-char string to the platform as device_sn.
+// Device identity: BLE sends this UUIDv4 in the 0x01 RequestDeviceInfo response.
 //
 // Stored in NVS "agent_link"/"dev_uuid". It survives OTA and factory reset: agent_link_forget()
-// clears credentials but not this, so the platform keeps recognising the unit.
+// clears bonds but not this, so the App keeps recognising the unit.
 //
-// esp_fill_random() is only a true RNG while RF (WiFi or BT) is running; before that, identical
+// esp_fill_random() requires active BT RF for this library; before that, identical
 // units generate identical values. Only mint once a transport has started.
 
 #include <stdbool.h>

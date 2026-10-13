@@ -42,13 +42,27 @@
 
 #include <cstring>
 #include "agent_link_buffer.h"
+#include "agent_link_task_storage.h"
 #include "agent_link_ble_policy.h"
+#include "agent_link_queue.h"
 #include <mutex>
 #include <atomic>
 #include <algorithm>
 #include <new>
 
 #include "esp_log.h"
+
+// Opt-in link diagnostics also work with Arduino's global Core Debug Level
+// set to None. They are emitted only on connection/parameter changes, never
+// per PCM notification; normal builds keep their usual ESP_LOGI filtering.
+#ifndef AGENT_LINK_BLE_LINK_DIAGNOSTICS
+#define AGENT_LINK_BLE_LINK_DIAGNOSTICS 0
+#endif
+#if AGENT_LINK_BLE_LINK_DIAGNOSTICS
+#define BLE_LINK_LOG(format, ...) esp_log_write(ESP_LOG_INFO, TAG, "BLE link: " format "\n", ##__VA_ARGS__)
+#else
+#define BLE_LINK_LOG(format, ...) ESP_LOGI(TAG, "link: " format, ##__VA_ARGS__)
+#endif
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -71,6 +85,18 @@
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 #include "os/os_mbuf.h"      // os_msys_get_pkthdr / os_mbuf_copydata
+#endif
+
+#if DEOTALAND_NIMBLE_ACTIVE
+// Pinned bundled-host factory: its real leading space and selected MSYS pool
+// determine the preflight budget. External hosts use public ATT allocation.
+#include "vendor/nimble-arduino/nimble/nimble/host/src/ble_hs_mbuf_priv.h"
+#endif
+
+#if AGENT_LINK_BLE_LINK_DIAGNOSTICS && DEOTALAND_NIMBLE_ACTIVE
+// Read-only diagnostic snapshots on the host task. These pinned bundled-host
+// fields do not enter a public API or affect external ESP-IDF host builds.
+#include "vendor/nimble-arduino/nimble/nimble/host/src/ble_l2cap_priv.h"
 #endif
 
 extern "C" void ble_store_config_init(void);
@@ -181,8 +207,10 @@ void RequestTerminate(uint32_t epoch) {
 void TerminateHostEvent(ble_npl_event*) {
     if (s_terminate_requested.exchange(false)) {
         const uint32_t epoch = s_terminate_epoch.load();
-        if (SessionAlive(epoch))
+        if (SessionAlive(epoch)) {
+            BLE_LINK_LOG("local terminate handle=%u epoch=%u", s_conn_handle.load(), unsigned(epoch));
             (void)ble_gap_terminate(s_conn_handle.load(), BLE_ERR_REM_USER_CONN_TERM);
+        }
     }
     s_terminate_scheduled.store(false, std::memory_order_release);
     if (s_terminate_requested) s_control_wake.Wake();
@@ -205,6 +233,11 @@ uint16_t s_h_batt  = 0; // 0x2A19 (battery, notify)
 std::atomic<uint8_t> s_batt_level{0};
 std::atomic<bool> s_batt_notify_enabled{false};
 std::atomic<bool> s_batt_dirty{false};
+#if AGENT_LINK_BLE_LINK_DIAGNOSTICS
+// Written/read only by host callbacks; no payload or credential contents.
+bool s_diagnostic_cmd_notify = false, s_diagnostic_file_notify = false;
+unsigned s_diagnostic_reading_budget = 0; // at most three metadata logs per IoActuate write
+#endif
 std::mutex s_device_info_mtx;              // current battery level 0-100
 char    s_di_mfr[AGENT_LINK_MANUFACTURER_MAX + 1] = "Deotaland";
 char    s_di_model[AGENT_LINK_MODEL_MAX + 1] = "AgentLink";
@@ -245,10 +278,23 @@ std::atomic<uint32_t> s_l2cap_epoch{0};
 std::atomic<uint32_t> s_img_epoch{0};
 std::atomic<uint16_t> s_l2cap_peer_mtu{0};
 std::atomic<uint16_t> s_img_peer_mtu{0};
+std::atomic<size_t> s_rec_sdu_limit{kL2capMps};
+std::atomic<size_t> s_img_sdu_limit{kL2capMps};
+#if AGENT_LINK_BLE_LINK_DIAGNOSTICS
+struct CocRxDiagnostics { uint32_t sdus = 0; uint64_t bytes = 0; };
+CocRxDiagnostics s_coc_rx_diagnostics[2]; // host-only, reset on each channel CONNECT
+#endif
 std::atomic<struct os_mbuf*> s_rx_pending{nullptr};
 std::atomic<bool> s_l2cap_rearm_pending{false};
 std::atomic<bool> s_img_rearm_pending{false};
 std::atomic<uint32_t> s_rx_epoch{0};
+std::atomic<uint32_t> s_rx_ticket{0}, s_rx_origin_generation{0}, s_rx_marker_generation{0};
+std::atomic<bool> s_rx_marker_queued{false}, s_rx_marker_scheduled{false};
+uint32_t s_rx_ticket_counter = 0; // host-only; never reuse a ticket on a new SDU
+ble_npl_event s_rx_marker_event;
+bool QueueL2capRxMarker();
+bool RxMarkerNeedsScheduling();
+void ScheduleRxMarker();
 size_t s_rx_offset = 0;
 bool s_rx_rearm_needed = false;  // poll-owned until published to the host
 size_t (*s_data_receiver)(const uint8_t*, size_t) = nullptr;
@@ -265,6 +311,16 @@ struct CocSendRequest {
     uint32_t channel_epoch = 0;
     struct os_mbuf* sdu = nullptr;
     int result = BLE_HS_ENOTCONN;
+    bool safe_retry = false; // rejected before SDK ownership / any wire bytes
+#if AGENT_LINK_BLE_LINK_DIAGNOSTICS
+    // A TX_UNSTALLED callback can overlap the worker's next-session reset;
+    // the request completion handshake only fences the actual send slot.
+    std::atomic<uint32_t> diagnostic_epoch{0}, diagnostic_transfer{0};
+    std::atomic<unsigned> diagnostic_errors{0};
+    std::atomic<bool> diagnostic_first{false}, diagnostic_no_mem{false};
+    std::atomic<bool> diagnostic_blocked{false};
+    std::atomic<unsigned> diagnostic_backpressure{0};
+#endif
 };
 CocSendRequest s_rec_send;
 CocSendRequest s_img_send;
@@ -355,6 +411,20 @@ int GattAccess(uint16_t /*conn*/, uint16_t /*attr*/, struct ble_gatt_access_ctxt
             if (s_stopping) return BLE_ATT_ERR_UNLIKELY;
             if (ble_hs_mbuf_to_flat(ctxt->om, buf, sizeof(buf), &n) != 0 || n == 0)
                 return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+#if AGENT_LINK_BLE_LINK_DIAGNOSTICS
+            if (n >= 6) {
+                BLE_LINK_LOG("GATT write chr=0x%04x version=%u type=0x%02x command=0x%02x seq=%u payload=%u bytes=%u",
+                             chr, buf[0], buf[1], buf[2], buf[3], unsigned(buf[4] | (uint16_t(buf[5])<<8)), n);
+                if (buf[0] == 1 && buf[1] == 1 && buf[2] == 0x33 &&
+                    size_t(buf[4] | (uint16_t(buf[5])<<8)) == size_t(n)-6)
+                    s_diagnostic_reading_budget = 3;
+                if (buf[0] == 1 && buf[1] == 1 && buf[2] == 0x05 && n >= 11)
+                    BLE_LINK_LOG("VoiceReply status=%u codec=%d", buf[10], n >= 12 ? int(buf[11]) : -1);
+            } else BLE_LINK_LOG("GATT short write chr=0x%04x bytes=%u", chr, n);
+#endif
+#if DEOTALAND_BLE_L2CAP_COC_AVAILABLE
+            if (!QueueL2capRxMarker()) return BLE_ATT_ERR_INSUFFICIENT_RES;
+#endif
             if (auto checked = s_on_ctrl_checked.load()) {
                 if (checked(buf, n) != ESP_OK) return BLE_ATT_ERR_INSUFFICIENT_RES;
             } else if (auto cb = s_on_recv.load()) {
@@ -464,6 +534,36 @@ esp_err_t NotifyHost(uint16_t handle, const uint8_t* data, size_t len, uint32_t 
     struct os_mbuf* om = ble_hs_mbuf_from_flat(data, len);
     if (!om) return ESP_ERR_NO_MEM;
     int rc = ble_gatts_notify_custom(conn, handle, om);  // on failure NimBLE has already freed om
+#if AGENT_LINK_BLE_LINK_DIAGNOSTICS
+    // Exact raw types exclude the encrypted 0x80 bit. Never interpret or dump
+    // payload bytes from a malformed header or mismatched declared length.
+    const bool framed = len >= 6 && data[0] == 1 && size_t(data[4] | (uint16_t(data[5])<<8)) == len-6;
+    const bool image = framed && data[1] == 3 &&
+        ((data[2] == 0x54 && len == 19) || (data[2] == 0x55 && len == 15));
+    const bool actuate = framed && data[1] == 2 && data[2] == 0x33 && len == 10 && data[6] == 0x33;
+    if (image || actuate) {
+        char hex[19*3];
+        constexpr char digits[] = "0123456789ABCDEF";
+        for (size_t i = 0; i < len; ++i) {
+            hex[i*3] = digits[data[i]>>4]; hex[i*3+1] = digits[data[i]&15]; hex[i*3+2] = ' ';
+        }
+        hex[len*3-1] = '\0';
+        if (image) BLE_LINK_LOG("IMAGE notify command=0x%02x handle=%u rc=%d bytes=%u hex=%s",
+                               data[2], handle, rc, unsigned(len), hex);
+        else BLE_LINK_LOG("IoActuate response handle=%u rc=%d seq=%u bytes=%u hex=%s",
+                          handle, rc, data[3], unsigned(len), hex);
+    }
+    if (s_diagnostic_reading_budget && framed && data[1] == 3 && data[2] == 0x19 && len >= 15 && data[6] == 7) {
+        const bool uptime = memcmp(data+7,"uptime0",7) == 0;
+        const bool camera = memcmp(data+7,"camera0",7) == 0;
+        if (uptime || camera) {
+            --s_diagnostic_reading_budget;
+            BLE_LINK_LOG("IoReading notify handle=%u rc=%d seq=%u id=%s type=%u value_len=%u remaining=%u",
+                         handle, rc, data[3], uptime ? "uptime0" : "camera0", data[14], unsigned(len-15),
+                         s_diagnostic_reading_budget);
+        }
+    }
+#endif
     return rc == 0 ? ESP_OK : ESP_FAIL;
 }
 
@@ -510,18 +610,25 @@ constexpr size_t kQueuePacketHardCap = AGENT_LINK_BLE_CTRL_SLOTS;
 static_assert(kQueuePacketHardCap >= 4, "BLE control queue needs at least four slots");
 constexpr size_t kControlQueueHardCap = kQueuePacketHardCap * 512;
 std::atomic<bool> s_control_running{false};
-agentlink::FixedQueue<ControlPacket,kQueuePacketHardCap> s_control_q;
+using ControlQueue = agentlink::FixedQueue<ControlPacket,kQueuePacketHardCap>;
+// Task-only packet storage does not consume scarce internal SRAM statically.
+// Retain its startup reservation across stop/start, just as the old singleton
+// retained its slots. Host callbacks/workers may not observe a released queue.
+agentlink::TaskStorage<ControlQueue> s_control_q;
 std::mutex s_control_mtx;
 size_t s_control_queued_bytes = 0;
+agentlink::blepolicy::ControlPriority s_control_priority;
 
 void ClearControlQueue() {
     std::lock_guard<std::mutex> lock(s_control_mtx);
-    while (!s_control_q.empty()) {
-        if (s_control_q.front().completion) {
-            s_control_q.front().completion->store(ESP_ERR_INVALID_STATE);
-            s_control_q.front().completion_wake->Wake();
+    if (!s_control_q.prepared()) return;
+    while (!s_control_q.get().empty()) {
+        if (s_control_q.get().front().completion) {
+            s_control_q.get().front().completion->store(ESP_ERR_INVALID_STATE);
+            s_control_q.get().front().completion_wake->Wake();
         }
-        s_control_q.pop();
+        s_control_q.get().pop();
+        s_control_priority.Completed();
     }
     s_control_queued_bytes = 0;
 }
@@ -540,13 +647,14 @@ void ControlTask(void*) {
         ScheduleTerminate();
 #if DEOTALAND_BLE_L2CAP_COC_AVAILABLE
         ScheduleL2capRearm();
+        ScheduleRxMarker();
 #endif
         ControlPacket packet = {};
         {
             std::lock_guard<std::mutex> lock(s_control_mtx);
-            if (!s_control_q.empty()) {
-                packet = std::move(s_control_q.front());
-                s_control_q.pop();
+            if (!s_control_q.get().empty()) {
+                packet = std::move(s_control_q.get().front());
+                s_control_q.get().pop();
                 s_control_queued_bytes -= packet.data.size();
 #if DEOTALAND_BLE_L2CAP_COC_AVAILABLE
                 s_rec_wake.Wake(); s_img_wake.Wake();
@@ -560,6 +668,7 @@ void ControlTask(void*) {
             bool retry = s_batt_notify_enabled && s_batt_dirty;
 #if DEOTALAND_BLE_L2CAP_COC_AVAILABLE
             retry = retry || s_l2cap_rearm_pending || s_img_rearm_pending;
+            retry = retry || RxMarkerNeedsScheduling();
 #endif
             s_control_wake.Wait(retry ? std::max<TickType_t>(1, pdMS_TO_TICKS(10)) : portMAX_DELAY);
             continue;
@@ -578,8 +687,11 @@ void ControlTask(void*) {
             ScheduleTerminate();
 #if DEOTALAND_BLE_L2CAP_COC_AVAILABLE
             ScheduleL2capRearm();
+            ScheduleRxMarker();
 #endif
         }
+        s_control_priority.Completed();
+        s_voice_wake.Wake();
         if (packet.completion) {
             packet.completion->store(result, std::memory_order_release);
             packet.completion_wake->Wake();
@@ -600,21 +712,22 @@ esp_err_t EnqueueControl(uint16_t handle, const uint8_t* data, size_t len, uint3
     try {
 #endif
     if (!data || len == 0) return ESP_ERR_INVALID_ARG;
-    if (!SessionAlive(epoch) || handle == 0 || !s_control_running.load()) return ESP_ERR_INVALID_STATE;
+    if (!SessionAlive(epoch) || handle == 0 || !s_control_running.load() || !s_control_q.prepared()) return ESP_ERR_INVALID_STATE;
     if (handle == s_h_evt && !s_event_notify_enabled) return ESP_ERR_INVALID_STATE;
     std::unique_lock<std::mutex> lock(s_control_mtx, std::try_to_lock);
     if (!lock.owns_lock()) return ESP_ERR_NO_MEM;
     const uint16_t mtu = ble_att_mtu(s_conn_handle.load());
     if (mtu < 3 || len > static_cast<size_t>(mtu - 3) || len > 512) return ESP_ERR_INVALID_SIZE;
     const size_t limit = agentlink::blepolicy::ControlQueueLimit(kQueuePacketHardCap, data, len);
-    if (s_control_q.size() >= limit || len > kControlQueueHardCap - s_control_queued_bytes) return ESP_ERR_NO_MEM;
+    if (s_control_q.get().size() >= limit || len > kControlQueueHardCap - s_control_queued_bytes) return ESP_ERR_NO_MEM;
     ControlPacket packet;
     packet.handle = handle;
     packet.epoch = epoch;
     packet.completion = completion;
     packet.completion_wake = completion_wake;
     packet.data.assign(data, data + len);
-    s_control_q.push(std::move(packet));
+    s_control_q.get().push(std::move(packet));
+    s_control_priority.Enqueued();
     s_control_queued_bytes += len;
     s_control_wake.Wake();
     return ESP_OK;
@@ -712,6 +825,8 @@ bool VoiceSendChunk(uint32_t sequence, const uint8_t* data, size_t len) {
 
 void VoiceSession() {
     ESP_LOGI(TAG, "voice task started (session=%u)", static_cast<unsigned>(s_voice.session_id));
+    // Session-local deadlines cannot survive a disconnect or recycled handle.
+    agentlink::blepolicy::VoiceCoalescing coalescing;
     bool failed = false;
     while (!failed) {
         if (!SessionAlive(s_voice.epoch) || !s_voice_notify_enabled) {
@@ -726,13 +841,18 @@ void VoiceSession() {
         size_t chunk_size=0;
         {
             std::lock_guard<std::mutex> lock(s_voice.mtx);
-            const size_t count = agentlink::blepolicy::VoiceDrainBytes(s_voice.q.size(), max_pcm, sizeof(chunk));
+            const size_t count = coalescing.DrainBytes(s_voice.q.size(), max_pcm, sizeof(chunk), end_req, NowMs());
             chunk_size=s_voice.q.pop(chunk,count);
             s_voice.queued_bytes.store(s_voice.q.size(),std::memory_order_release);
         }
         if (chunk_size == 0) {
             if (end_req) { ESP_LOGI(TAG, "voice: drained — done"); break; }
-            s_voice_wake.Wait();
+            if (coalescing.Waiting()) {
+                const uint32_t remaining = coalescing.WaitMs(NowMs());
+                // If the deadline elapsed after inspecting the ring, loop now;
+                // do not turn that zero remaining time into an infinite wait.
+                if (remaining) s_voice_wake.Wait(std::max<TickType_t>(1, pdMS_TO_TICKS(remaining)));
+            } else s_voice_wake.Wait();
             continue;
         }
 
@@ -743,6 +863,14 @@ void VoiceSession() {
 
             bool sent = false;
             for (uint32_t retry = 0; retry < kVoiceMaxRetries; retry++) {
+                // A control packet remains pending after the FIFO pop and
+                // throughout congestion retries. Let that worker claim the
+                // next freed mbuf instead of racing it with every PCM slice.
+                // Its existing bounded watchdog handles persistent failure.
+                while (s_control_priority.Pending() && SessionAlive(s_voice.epoch)) {
+                    s_control_wake.Wake();
+                    s_voice_wake.Wait(std::max<TickType_t>(1, pdMS_TO_TICKS(10)));
+                }
                 if (!SessionAlive(s_voice.epoch)) break;
                 if (VoiceSendChunk(seq, chunk + off, n)) { sent = true; break; }
                 // congestion backoff: 1ms x5 -> 5ms x15 -> 10ms (a failed notify signals mbuf-pool pressure).
@@ -907,6 +1035,71 @@ void ScheduleL2capRearm() {
         ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_rearm_event);
 }
 
+#if AGENT_LINK_BLE_LINK_DIAGNOSTICS
+void ResetCocDiagnostics(CocSendRequest& request, bool image, uint32_t epoch) {
+    const uint32_t transfer = image ? s_img.transfer_id : s_rec.transfer_id;
+    if (request.diagnostic_epoch == epoch && request.diagnostic_transfer == transfer) return;
+    request.diagnostic_epoch = epoch; request.diagnostic_transfer = transfer;
+    request.diagnostic_first = false; request.diagnostic_errors = 0;
+    request.diagnostic_no_mem = false;
+    request.diagnostic_blocked = false; request.diagnostic_backpressure = 0;
+}
+
+void LogCocChannel(const char* reason, bool image, struct ble_l2cap_chan* channel) {
+    ble_l2cap_chan_info info = {};
+    const int rc = ble_l2cap_get_chan_info(channel, &info);
+    if (rc != 0) {
+        BLE_LINK_LOG("CoC %s psm=0x%04x info_rc=%d", reason, image ? kImgPsm : kL2capPsm, rc);
+        return;
+    }
+    // In CoC context the public L2CAP MTU fields alias the corresponding MPS.
+    BLE_LINK_LOG("CoC %s psm=0x%04x scid=%u dcid=%u local_mtu=%u local_mps=%u peer_mtu=%u peer_mps=%u",
+                 reason, info.psm, info.scid, info.dcid, info.our_coc_mtu,
+                 info.our_l2cap_mtu, info.peer_coc_mtu, info.peer_l2cap_mtu);
+#if DEOTALAND_NIMBLE_ACTIVE
+    BLE_LINK_LOG("CoC credits psm=0x%04x tx=%u rx=%u initial=%u auto_rx=%u tx_pending=%u tx_offset=%u",
+                 info.psm, channel->coc_tx.credits, channel->coc_rx.credits,
+                 channel->initial_credits, unsigned(!channel->disable_auto_credit_update),
+                 unsigned(channel->coc_tx.sdus[0] != nullptr), channel->coc_tx.data_offset);
+#endif
+}
+#endif
+
+// Host-only snapshot of the exact packet factory's pool. Global MSYS free
+// counts are insufficient: small-pool allocation does not fall back to a
+// still-free larger pool. This is admission control, not an atomic reservation;
+// reserve capacity for concurrent control/signaling, and fail closed on any
+// SDK error after ownership transfer.
+bool CocSendBudget(struct ble_l2cap_chan* channel, size_t bytes,
+                   size_t& free_blocks, size_t& needed, size_t& limit) {
+    ble_l2cap_chan_info info = {};
+    if (ble_l2cap_get_chan_info(channel, &info) != 0) return false;
+#if DEOTALAND_NIMBLE_ACTIVE
+    struct os_mbuf* probe = ble_hs_mbuf_l2cap_pkt();
+#else
+    struct os_mbuf* probe = ble_hs_mbuf_att_pkt();
+#endif
+    free_blocks = 0; needed = SIZE_MAX; limit = bytes;
+    if (!probe) return false;
+    size_t first_capacity = OS_MBUF_TRAILINGSPACE(probe);
+#if !DEOTALAND_NIMBLE_ACTIVE
+    // Conservative room for external hosts' controller-specific headers;
+    // these builds do not depend on pinned private factory/channel fields.
+    first_capacity = first_capacity > 8 ? first_capacity-8 : 0;
+#endif
+    needed = agentlink::blepolicy::CocTxBlocks(bytes, info.peer_l2cap_mtu,
+                                              first_capacity, probe->om_omp->omp_databuf_len);
+    os_sr_t state;
+    OS_ENTER_CRITICAL(state);
+    free_blocks = size_t(probe->om_omp->omp_pool->mp_num_free)+1; // return probe
+    const size_t total_blocks = probe->om_omp->omp_pool->mp_num_blocks;
+    OS_EXIT_CRITICAL(state);
+    limit = agentlink::blepolicy::CocSduLimit(bytes, info.peer_l2cap_mtu, first_capacity,
+                                             probe->om_omp->omp_databuf_len, total_blocks);
+    os_mbuf_free_chain(probe);
+    return agentlink::blepolicy::CocPoolReady(free_blocks, needed);
+}
+
 void SendL2capHost(ble_npl_event* event) {
     auto* request = static_cast<CocSendRequest*>(ble_npl_event_get_arg(event));
     auto& channel = request->image ? s_img_chan : s_l2cap_chan;
@@ -916,8 +1109,48 @@ void SendL2capHost(ble_npl_event* event) {
     struct os_mbuf* sdu = request->sdu;
     request->sdu = nullptr;
     request->result = BLE_HS_ENOTCONN;
+    request->safe_retry = false;
     if (SessionAlive(request->epoch) && request->channel_epoch == channel_epoch.load() &&
         connected && channel.load()) {
+        const size_t bytes = OS_MBUF_PKTLEN(sdu);
+#if AGENT_LINK_BLE_LINK_DIAGNOSTICS
+        const uint32_t transfer = request->image ? s_img.transfer_id : s_rec.transfer_id;
+        ResetCocDiagnostics(*request, request->image, request->epoch);
+        const bool first = !request->diagnostic_first;
+        if (first && !request->diagnostic_blocked)
+            LogCocChannel("before-first-send", request->image, channel.load());
+#endif
+        size_t free_blocks = 0, needed = SIZE_MAX, limit = bytes;
+        if (!CocSendBudget(channel.load(), bytes, free_blocks, needed, limit)) {
+            // A budget larger than the entire pool cannot recover by waiting.
+            // The current SDU has not entered the SDK: retry at the same byte
+            // offset with a smaller channel-local limit, preserving the stream.
+            auto& current_limit = request->image ? s_img_sdu_limit : s_rec_sdu_limit;
+            if (limit >= 2 && limit < bytes && limit < current_limit.load()) {
+                current_limit = limit;
+                BLE_LINK_LOG("CoC adaptive SDU psm=0x%04x limit=%u oversized_budget=%u",
+                             request->image ? kImgPsm : kL2capPsm, unsigned(limit), unsigned(needed));
+            }
+            // No SDK call occurred: worker can retry the same bytes safely.
+            request->safe_retry = true; request->result = BLE_HS_ENOMEM;
+            os_mbuf_free_chain(sdu);
+#if AGENT_LINK_BLE_LINK_DIAGNOSTICS
+            const unsigned retries = request->diagnostic_backpressure.fetch_add(1);
+            if (!request->diagnostic_blocked.exchange(true) && retries < 4)
+                BLE_LINK_LOG("CoC preflight backpressure psm=0x%04x bytes=%u small_free=%u needed=%u reserve=%u",
+                             request->image ? kImgPsm : kL2capPsm, unsigned(bytes), unsigned(free_blocks),
+                             unsigned(needed), unsigned(agentlink::blepolicy::kCocControlReserve));
+#endif
+            request->done.store(true, std::memory_order_release);
+            xTaskNotifyGive(request->waiter);
+            return;
+        }
+#if AGENT_LINK_BLE_LINK_DIAGNOSTICS
+        if (request->diagnostic_blocked.exchange(false) && request->diagnostic_backpressure < 5)
+            BLE_LINK_LOG("CoC preflight resumed psm=0x%04x small_free=%u needed=%u retries=%u",
+                         request->image ? kImgPsm : kL2capPsm, unsigned(free_blocks), unsigned(needed),
+                         unsigned(request->diagnostic_backpressure.load()));
+#endif
         // Set before send: an immediate TX_UNSTALLED callback must win.
         stalled = true;
         request->result = ble_l2cap_send(channel.load(), sdu);
@@ -926,6 +1159,16 @@ void SendL2capHost(ble_npl_event* event) {
         // arise after ownership transfer and consume the SDU internally.
         if (request->result == BLE_HS_EBUSY || request->result == BLE_HS_EBADDATA)
             os_mbuf_free_chain(sdu);
+#if AGENT_LINK_BLE_LINK_DIAGNOSTICS
+        if (first || (request->result != 0 && request->diagnostic_errors++ < 4)) {
+            request->diagnostic_first = true;
+            BLE_LINK_LOG("CoC send psm=0x%04x transfer=%u bytes=%u rc=%d stalled=%u epoch=%u channel_epoch=%u",
+                         request->image ? kImgPsm : kL2capPsm, unsigned(transfer), unsigned(bytes),
+                         request->result, unsigned(stalled.load()), unsigned(request->epoch), unsigned(request->channel_epoch));
+            if (SessionAlive(request->epoch) && connected && request->channel_epoch == channel_epoch.load())
+                LogCocChannel("after-send", request->image, channel.load());
+        }
+#endif
     } else os_mbuf_free_chain(sdu);
     request->done.store(true, std::memory_order_release);
     xTaskNotifyGive(request->waiter);
@@ -934,8 +1177,22 @@ void SendL2capHost(ble_npl_event* event) {
 int SendL2capWorker(CocSendRequest& request, bool image, uint32_t epoch,
                     uint32_t channel_epoch, const uint8_t* data, size_t len) {
     if (!SessionAlive(epoch)) return -2;
-    struct os_mbuf* sdu = os_msys_get_pkthdr(len, 0);
-    if (!sdu) return -1;  // allocation before send is safe to retry
+#if AGENT_LINK_BLE_LINK_DIAGNOSTICS
+    ResetCocDiagnostics(request, image, epoch);
+#endif
+    // Even a tiny tail uses the large SDU pool, leaving small mbufs for the
+    // packet factory which splits this SDU into transmitted K-frames.
+    struct os_mbuf* sdu = os_msys_get_pkthdr(kRecMaxSdu, 0);
+    if (!sdu) {
+#if AGENT_LINK_BLE_LINK_DIAGNOSTICS
+        if (!request.diagnostic_no_mem) {
+            request.diagnostic_no_mem = true;
+            BLE_LINK_LOG("CoC SDU allocation failed psm=0x%04x bytes=%u epoch=%u", image ? kImgPsm : kL2capPsm,
+                         unsigned(len), unsigned(epoch));
+        }
+#endif
+        return -1;  // allocation before send is safe to retry
+    }
     if (os_mbuf_append(sdu, data, len) != 0) { os_mbuf_free_chain(sdu); return -1; }
     request.image = image;
     request.epoch = epoch;
@@ -950,6 +1207,9 @@ int SendL2capWorker(CocSendRequest& request, bool image, uint32_t epoch,
     while (!request.done.load(std::memory_order_acquire));
     if (request.result == 0) return 0;
     if (request.result == BLE_HS_ESTALLED) return 1;
+    if (request.safe_retry) return -1;
+    if (request.result == BLE_HS_ENOMEM)
+        (image ? s_img.last_error : s_rec.last_error) = ESP_ERR_NO_MEM;
     return -2;  // a partial SDU may be on air; never replay it after an error
 }
 
@@ -962,7 +1222,13 @@ bool WaitL2capTx(bool image, uint32_t epoch, uint32_t channel_epoch) {
     while (stalled.load(std::memory_order_acquire)) {
         const uint32_t elapsed = NowMs() - started;
         if (!SessionAlive(epoch) || !connected || current_epoch.load() != channel_epoch ||
-            truncated || elapsed >= kRecStallWaitMs) return false;
+            truncated || elapsed >= kRecStallWaitMs) {
+            BLE_LINK_LOG("CoC wait failed psm=0x%04x waited_ms=%u stalled=%u alive=%u connected=%u truncated=%u epoch=%u current_epoch=%u channel_epoch=%u current_channel_epoch=%u",
+                         image ? kImgPsm : kL2capPsm, unsigned(elapsed), unsigned(stalled.load()),
+                         unsigned(SessionAlive(epoch)), unsigned(connected.load()), unsigned(truncated.load()),
+                         unsigned(epoch), unsigned(s_connection_epoch.load()), unsigned(channel_epoch), unsigned(current_epoch.load()));
+            return false;
+        }
         const uint32_t remaining = kRecStallWaitMs - elapsed;
         (image ? s_img_wake : s_rec_wake).Wait(std::max<TickType_t>(1, pdMS_TO_TICKS(remaining)));
     }
@@ -980,18 +1246,78 @@ void WaitStreamStart(WorkerSignal& wake, uint32_t epoch) {
 
 // Retain one SDU until poll() has delivered every byte. Delaying recv_ready
 // withholds credit from the peer when the application/OTA queue is full.
+// Host-only admission: the marker occupies the SDU's arrival position in the
+// same FIFO as later GATT control, while the mbuf itself stays poll-owned.
+bool QueueL2capRxMarker() {
+    if (!s_rx_pending.load(std::memory_order_acquire)) return true;
+    if (s_stopping) return false;
+    const uint32_t ticket=s_rx_ticket.load();
+    const uint32_t generation=agentlink::RxGeneration();
+    if (s_rx_marker_queued && s_rx_marker_generation==generation) return true;
+    if (!ticket || !agentlink::RxDeferredHasSpace()) return false;
+    if (agentlink::RxPushDeferredStream(AGENT_STREAM_VOICE,ticket,s_rx_origin_generation.load()) != ESP_OK) return false;
+    if (s_rx_ticket==ticket && s_rx_pending.load(std::memory_order_acquire)) {
+        s_rx_marker_generation=generation;
+        s_rx_marker_queued.store(true,std::memory_order_release);
+    }
+    return true;
+}
+void RxMarkerHost(ble_npl_event*) {
+    s_rx_marker_scheduled.store(false,std::memory_order_release);
+    (void)QueueL2capRxMarker();
+}
+bool RxMarkerNeedsScheduling() {
+    return s_rx_pending.load(std::memory_order_acquire) &&
+        (!s_rx_marker_queued || s_rx_marker_generation!=agentlink::RxGeneration());
+}
+// Worker-only: NPL's event queue can wait for space. poll() only wakes this
+// worker, which retries admission without making loop() wait for the host.
+void ScheduleRxMarker() {
+    if (!s_stopping && RxMarkerNeedsScheduling() && agentlink::RxDeferredHasSpace() &&
+        !s_rx_marker_scheduled.exchange(true))
+        ble_npl_eventq_put(nimble_port_get_dflt_eventq(),&s_rx_marker_event);
+}
+void ClearRxMarker() {
+    s_rx_marker_queued=false; s_rx_marker_generation=0;
+    s_rx_origin_generation=0; s_rx_ticket=0;
+}
+// Owns sdu on every path. Only the host can publish a new retained SDU; poll()
+// clears its metadata before releasing the pointer and granting new credit.
+void RetainL2capRx(struct os_mbuf* sdu) {
+    if (s_rx_pending.load(std::memory_order_acquire)) {
+        os_mbuf_free_chain(sdu);
+        ESP_LOGE(TAG,"unexpected second L2CAP SDU; closing channel");
+        if (auto* chan=s_l2cap_chan.load()) (void)ble_l2cap_disconnect(chan);
+        return;
+    }
+    if (!++s_rx_ticket_counter) ++s_rx_ticket_counter;
+    s_rx_epoch=s_l2cap_epoch.load();
+    s_rx_ticket=s_rx_ticket_counter;
+    s_rx_origin_generation=agentlink::RxGeneration();
+    s_rx_marker_generation=0; s_rx_marker_queued=false;
+    s_rx_pending.store(sdu,std::memory_order_release);
+    (void)QueueL2capRxMarker();
+}
 void PollL2capRx() {
     if (s_stopping) return;
     const uint32_t connection_epoch = s_connection_epoch.load();
     struct os_mbuf* sdu = s_rx_pending.load(std::memory_order_acquire);
     const uint32_t rx_epoch = s_rx_epoch.load();
     if (sdu && (rx_epoch != s_l2cap_epoch.load() || !s_l2cap_connected)) {
+        ClearRxMarker();
         if (s_rx_pending.exchange(nullptr) == sdu) os_mbuf_free_chain(sdu);
         s_rx_offset = 0;
         s_rx_rearm_needed = false;
         sdu = nullptr;
     }
     if (sdu) {
+        const uint32_t ticket=s_rx_ticket.load();
+        const uint32_t active=agentlink::RxDeferredTicket();
+        if (RxMarkerNeedsScheduling()) s_control_wake.Wake();
+        if (active!=ticket) {
+            if (active) agentlink::RxDeferredComplete(active); // a retired marker owns no live SDU
+            return;
+        }
         const size_t total = OS_MBUF_PKTLEN(sdu);
         uint8_t buf[kL2capMps];
         for (unsigned work = 0; work < 4 && s_rx_offset < total; ++work) {
@@ -1011,11 +1337,17 @@ void PollL2capRx() {
             if (accepted < n) return;
         }
         if (s_rx_offset < total) return;
+        agentlink::RxDeferredComplete(ticket);
+        ClearRxMarker();
         s_rx_pending.store(nullptr, std::memory_order_release);
         os_mbuf_free_chain(sdu);
         s_rx_offset = 0;
         s_rearm_epoch.store(rx_epoch);
         s_rx_rearm_needed = true;
+    }
+    else {
+        const uint32_t active=agentlink::RxDeferredTicket();
+        if (active) agentlink::RxDeferredComplete(active);
     }
     if (s_rx_rearm_needed && !s_rx_pending.load() && s_l2cap_connected &&
         s_rearm_epoch.load() == s_l2cap_epoch.load() && (!s_data_ready || s_data_ready()))
@@ -1039,22 +1371,37 @@ int L2capEvent(struct ble_l2cap_event* event, void* arg) {
         return rc;
     }
     case BLE_L2CAP_EVENT_COC_CONNECTED:
+        BLE_LINK_LOG("CoC connect psm=0x%04x status=%d", image ? kImgPsm : kL2capPsm, event->connect.status);
         if (event->connect.status == 0) {
             ble_l2cap_chan_info info = {};
             if (ble_l2cap_get_chan_info(event->connect.chan, &info) != 0 || !info.peer_coc_mtu) {
                 (void)ble_l2cap_disconnect(event->connect.chan);
                 return 0;
             }
+#if AGENT_LINK_BLE_LINK_DIAGNOSTICS
+            s_coc_rx_diagnostics[image ? 1 : 0] = {};
+#endif
             if (image) {
                 s_img_epoch.fetch_add(1); s_img_peer_mtu = info.peer_coc_mtu;
+                s_img_sdu_limit = kRecMaxSdu;
                 s_img_stalled = false; s_img_chan = event->connect.chan; s_img_connected = true;
             } else {
                 s_l2cap_epoch.fetch_add(1); s_l2cap_peer_mtu = info.peer_coc_mtu;
+                s_rec_sdu_limit = kRecMaxSdu;
                 s_l2cap_stalled = false; s_l2cap_chan = event->connect.chan; s_l2cap_connected = true;
             }
+#if AGENT_LINK_BLE_LINK_DIAGNOSTICS
+            LogCocChannel("connected", image, event->connect.chan);
+#endif
         }
         return 0;
     case BLE_L2CAP_EVENT_COC_DISCONNECTED:
+        BLE_LINK_LOG("CoC disconnected psm=0x%04x", image ? kImgPsm : kL2capPsm);
+#if AGENT_LINK_BLE_LINK_DIAGNOSTICS
+        BLE_LINK_LOG("CoC RX total psm=0x%04x sdus=%u bytes=%llu", image ? kImgPsm : kL2capPsm,
+                     unsigned(s_coc_rx_diagnostics[image ? 1 : 0].sdus),
+                     static_cast<unsigned long long>(s_coc_rx_diagnostics[image ? 1 : 0].bytes));
+#endif
         if (image && event->disconnect.chan == s_img_chan.load()) {
             s_img_epoch.fetch_add(1);
             s_img_chan = nullptr; s_img_connected = false; s_img_stalled = false;
@@ -1069,6 +1416,12 @@ int L2capEvent(struct ble_l2cap_event* event, void* arg) {
         return 0;
     case BLE_L2CAP_EVENT_COC_DATA_RECEIVED: {
         struct os_mbuf* sdu = event->receive.sdu_rx;
+#if AGENT_LINK_BLE_LINK_DIAGNOSTICS
+        auto& diagnostic = s_coc_rx_diagnostics[image ? 1 : 0];
+        const size_t received = OS_MBUF_PKTLEN(sdu);
+        if (!diagnostic.sdus) BLE_LINK_LOG("CoC first RX psm=0x%04x bytes=%u", image ? kImgPsm : kL2capPsm, unsigned(received));
+        ++diagnostic.sdus; diagnostic.bytes += received;
+#endif
         if (image || s_stopping) {
             os_mbuf_free_chain(sdu);
             if (image && !s_stopping && !RearmL2capRx(event->receive.chan)) {
@@ -1077,27 +1430,31 @@ int L2capEvent(struct ble_l2cap_event* event, void* arg) {
                 s_control_wake.Wake();
             }
         } else {
-            struct os_mbuf* empty = nullptr;
-            if (!s_rx_pending.load()) s_rx_epoch.store(s_l2cap_epoch.load());
-            if (!s_rx_pending.compare_exchange_strong(empty, sdu)) {
-                os_mbuf_free_chain(sdu);
-                ESP_LOGE(TAG, "unexpected second L2CAP SDU; closing channel");
-                (void)ble_l2cap_disconnect(event->receive.chan);
-            }
+            RetainL2capRx(sdu);
         }
         return 0;
     }
-    case BLE_L2CAP_EVENT_COC_TX_UNSTALLED:
+    case BLE_L2CAP_EVENT_COC_TX_UNSTALLED: {
+#if AGENT_LINK_BLE_LINK_DIAGNOSTICS
+        auto& diagnostic = image ? s_img_send : s_rec_send;
+        if (diagnostic.diagnostic_errors < 4) {
+            BLE_LINK_LOG("CoC TX_UNSTALLED psm=0x%04x status=%d", image ? kImgPsm : kL2capPsm, event->tx_unstalled.status);
+            LogCocChannel("unstalled", image, event->tx_unstalled.chan);
+        }
+#endif
         if (image && event->tx_unstalled.chan == s_img_chan.load()) {
+            if (event->tx_unstalled.status == BLE_HS_ENOMEM) s_img.last_error = ESP_ERR_NO_MEM;
             if (event->tx_unstalled.status) s_img.truncated = true;
             s_img_stalled = false;
             s_img_wake.Wake();
         } else if (!image && event->tx_unstalled.chan == s_l2cap_chan.load()) {
+            if (event->tx_unstalled.status == BLE_HS_ENOMEM) s_rec.last_error = ESP_ERR_NO_MEM;
             if (event->tx_unstalled.status) s_rec.truncated = true;
             s_l2cap_stalled = false;
             s_rec_wake.Wake();
         }
         return 0;
+    }
     default: return 0;
     }
 }
@@ -1194,14 +1551,14 @@ void RecordingSession() {
         for (size_t offset = 0; offset < chunk_size && !abort;) {
             if (!WaitL2capTx(false, s_rec.epoch, s_rec.channel_epoch)) { abort = true; break; }
             const size_t remaining = chunk_size - offset;
-            const size_t count = std::min(remaining, std::min<size_t>(kRecMaxSdu, s_l2cap_peer_mtu.load()));
+            const size_t count = std::min(remaining, std::min(s_rec_sdu_limit.load(), size_t(s_l2cap_peer_mtu.load())));
             const int result = RecL2capSend(chunk + offset, count);
             if (result >= 0) {
                 if (!WaitL2capTx(false, s_rec.epoch, s_rec.channel_epoch)) { abort = true; break; }
                 s_rec.sent_bytes.fetch_add(static_cast<uint32_t>(count), std::memory_order_release);
                 offset += count;
                 last_progress = NowMs();
-                if (++burst == 16) { burst=0; SleepWorker(1); }
+                if (++burst == agentlink::blepolicy::kCocBurstSdus) { burst=0; SleepWorker(1); }
             } else if (result == -2 || !SessionAlive(s_rec.epoch) || !s_l2cap_connected || NowMs() - last_progress >= kRecStallWaitMs) {
                 abort = true;
             } else {
@@ -1220,10 +1577,12 @@ void RecordingSession() {
     std::unique_lock<std::mutex> finish_lock(s_rec.mtx);
     const uint8_t* header = ok && s_rec.final_header.size() >= 60
                                 ? s_rec.final_header.data() : nullptr;
-    if (!SessionAlive(s_rec.epoch)) s_rec.last_error = ESP_ERR_INVALID_STATE;
+    if (!SessionAlive(s_rec.epoch)) {
+        if (s_rec.last_error == ESP_OK) s_rec.last_error = ESP_ERR_INVALID_STATE;
+    }
     else if (!RecSendStreamEnd(s_rec.transfer_id, ok ? 0 : 1,
                               s_rec.sent_bytes.load(std::memory_order_acquire), header))
-        s_rec.last_error = ESP_ERR_TIMEOUT;
+        { if (s_rec.last_error == ESP_OK) s_rec.last_error = ESP_ERR_TIMEOUT; }
     ESP_LOGI(TAG, "recording/ASR stream %u ended (ok=%d, bytes=%u)",
              static_cast<unsigned>(s_rec.transfer_id), ok,
              static_cast<unsigned>(s_rec.sent_bytes.load(std::memory_order_acquire)));
@@ -1232,7 +1591,7 @@ void RecordingSession() {
     finish_lock.unlock();
     }
     if (s_rec.truncated && s_rec.last_error == ESP_OK) s_rec.last_error = ESP_ERR_TIMEOUT;
-    else if (!s_rec.complete) s_rec.last_error = ESP_ERR_INVALID_STATE;
+    else if (!s_rec.complete && s_rec.last_error == ESP_OK) s_rec.last_error = ESP_ERR_INVALID_STATE;
     s_rec.active.store(false, std::memory_order_release);
 }
 
@@ -1355,6 +1714,9 @@ esp_err_t RecordingEnd(bool complete, const uint8_t* final_header, size_t header
 }
 // Image snapshot uplink implementation
 // Mirrors the audio path; reuses kRecMaxSdu / kRecStallWaitMs / kRecStartDelayMs (generic L2CAP params).
+// ImageStart's wire format numbers differ from the public encoding enum.
+constexpr uint8_t kImgWireJpeg = 0;
+constexpr uint8_t kImgWireRgb565 = 1;  // big-endian RGB565, width * height * 2 bytes
 // 0x54 ImageStart: payload(13) = transfer_id(4) + format(1) + width(2) + height(2) + total_len(4). Notify 0xFFC4.
 bool ImgSendStreamStart(uint32_t tid, uint8_t fmt, uint16_t w, uint16_t h, uint32_t total) {
     uint8_t f[6 + 13];
@@ -1390,6 +1752,8 @@ int ImgL2capSend(const uint8_t* data, size_t len) {
 
 // Worker: drain the image queue to L2CAP in <=MPS SDUs (credit backpressure), then emit 0x55. One image at a time.
 void ImageSession() {
+    BLE_LINK_LOG("IMAGE start transfer=%u format=%u width=%u height=%u total=%u", unsigned(s_img.transfer_id),
+                 s_img.format, s_img.width, s_img.height, unsigned(s_img.total_len));
     if (!ImgSendStreamStart(s_img.transfer_id, s_img.format, s_img.width, s_img.height, s_img.total_len)) {
         ESP_LOGE(TAG, "image start notification failed");
         s_img.truncated = true; s_img.end_req = true;
@@ -1419,14 +1783,14 @@ void ImageSession() {
         bool abort = false;
         for (size_t off = 0; off < chunk_size && !abort; ) {
             if (!WaitL2capTx(true, s_img.epoch, s_img.channel_epoch)) { abort = true; break; }
-            const size_t n = std::min(chunk_size - off, std::min<size_t>(kRecMaxSdu, s_img_peer_mtu.load()));
+            const size_t n = std::min(chunk_size - off, std::min(s_img_sdu_limit.load(), size_t(s_img_peer_mtu.load())));
             int r = ImgL2capSend(chunk + off, n);
             if (r >= 0) {                            // 0 = sent, 1 = sent then stalled: bytes are on their way
                 if (!WaitL2capTx(true, s_img.epoch, s_img.channel_epoch)) { abort = true; break; }
                 s_img.sent_bytes.fetch_add(static_cast<uint32_t>(n), std::memory_order_release);
                 off += n;
                 last_progress = NowMs();
-                if (++burst == 16) { burst=0; SleepWorker(1); }
+                if (++burst == agentlink::blepolicy::kCocBurstSdus) { burst=0; SleepWorker(1); }
             } else {                                 // pool empty / transient: brief backoff, then retry
                 if (r == -2 || !SessionAlive(s_img.epoch) || !s_img_connected || NowMs() - last_progress >= kRecStallWaitMs) { abort = true; break; }
                 SleepWorker(10);
@@ -1438,9 +1802,11 @@ void ImageSession() {
     const bool ok = !s_img.truncated.load(std::memory_order_acquire) && s_img.complete.load(std::memory_order_acquire) &&
                    s_img.sent_bytes.load() == s_img.total_len;
     const uint8_t status = ok ? 0x00 : 0x01;
-    if (!SessionAlive(s_img.epoch)) s_img.last_error = ESP_ERR_INVALID_STATE;
+    if (!SessionAlive(s_img.epoch)) {
+        if (s_img.last_error == ESP_OK) s_img.last_error = ESP_ERR_INVALID_STATE;
+    }
     else if (!ImgSendStreamEnd(s_img.transfer_id, status, s_img.sent_bytes.load(std::memory_order_acquire)))
-        s_img.last_error = ESP_ERR_TIMEOUT;
+        { if (s_img.last_error == ESP_OK) s_img.last_error = ESP_ERR_TIMEOUT; }
     ESP_LOGI(TAG, "image stream %u ended (status=%u valid_bytes=%u)",
              static_cast<unsigned>(s_img.transfer_id), status,
              static_cast<unsigned>(s_img.sent_bytes.load(std::memory_order_acquire)));
@@ -1454,6 +1820,14 @@ void ImageSession() {
         else if (!s_img.complete) s_img.last_error = ESP_ERR_INVALID_STATE;
         else if (!ok) s_img.last_error = ESP_ERR_INVALID_SIZE;
     }
+    BLE_LINK_LOG("IMAGE terminal transfer=%u status=%u accepted=%u submitted=%u total=%u rejected=%u truncated=%u complete=%u last=%d",
+                 unsigned(s_img.transfer_id), status, unsigned(s_img.accepted_bytes.load()), unsigned(s_img.sent_bytes.load()),
+                 unsigned(s_img.total_len), unsigned(s_img.rejected_writes.load()), unsigned(s_img.truncated.load()),
+                 unsigned(s_img.complete.load()), s_img.last_error.load());
+#if AGENT_LINK_BLE_LINK_DIAGNOSTICS
+    BLE_LINK_LOG("IMAGE CoC admission transfer=%u preflight_retries=%u sdk_rc=%d",
+                 unsigned(s_img.transfer_id), unsigned(s_img_send.diagnostic_backpressure.load()), s_img_send.result);
+#endif
     s_img.active.store(false, std::memory_order_release);
 }
 
@@ -1564,6 +1938,55 @@ esp_err_t ImageEnd(bool complete) {
 #endif
 
 // GAP events: connect / disconnect / advertising complete.
+void LogConnectionParameters(uint16_t handle, int status) {
+    struct ble_gap_conn_desc desc = {};
+    const int rc = ble_gap_conn_find(handle, &desc);
+    if (rc != 0) {
+        BLE_LINK_LOG("parameters handle=%u status=%d lookup=%d", handle, status, rc);
+        return;
+    }
+    BLE_LINK_LOG("parameters handle=%u status=%d interval_us=%u latency=%u timeout_ms=%u mtu=%u",
+                 handle, status, static_cast<unsigned>(desc.conn_itvl) * 1250u,
+                 desc.conn_latency, static_cast<unsigned>(desc.supervision_timeout) * 10u,
+                 ble_att_mtu(handle));
+}
+
+bool s_phy_requested=false; // host-only, one advisory attempt per connection
+void RequestTwoMPhy(uint16_t handle) {
+    if (s_phy_requested || !s_connected || handle!=s_conn_handle.load()) return;
+    s_phy_requested=true;
+#if defined(SOC_BLE_50_SUPPORTED) && SOC_BLE_50_SUPPORTED && \
+    (!defined(CONFIG_BT_NIMBLE_50_FEATURE_SUPPORT) || CONFIG_BT_NIMBLE_50_FEATURE_SUPPORT)
+    const int rc=ble_gap_set_prefered_le_phy(handle,BLE_GAP_LE_PHY_2M_MASK,
+                                           BLE_GAP_LE_PHY_2M_MASK,BLE_GAP_LE_PHY_CODED_ANY);
+    BLE_LINK_LOG("2M PHY request handle=%u rc=%d",handle,rc);
+#else
+    (void)handle;
+#endif
+}
+void RequestVoiceConnectionParameters(uint16_t handle) {
+    struct ble_gap_upd_params params = {};
+    params.itvl_min = agentlink::blepolicy::kVoiceIntervalMin;
+    params.itvl_max = agentlink::blepolicy::kVoiceIntervalMax;
+    params.latency = agentlink::blepolicy::kVoiceLatency;
+    params.supervision_timeout = agentlink::blepolicy::kVoiceSupervisionTimeout;
+    const int rc = ble_gap_update_params(handle, &params);
+    // A rejected/unsupported request is advisory and must not retire READY.
+    BLE_LINK_LOG("interval request handle=%u min_us=%u max_us=%u latency=%u rc=%d",
+                 handle, static_cast<unsigned>(params.itvl_min) * 1250u,
+                 static_cast<unsigned>(params.itvl_max) * 1250u, params.latency, rc);
+    // Avoid overlapping link procedures: request PHY after the interval event,
+    // or now if the interval preference was rejected before it could start.
+    if(rc!=0) RequestTwoMPhy(handle);
+    // The bundled host already requests DLE 251/2120 after CONNECT. Observe
+    // its actual completion instead of issuing a competing duplicate request.
+    // Keep compatibility when an external ESP-IDF host does not do that.
+#if !DEOTALAND_NIMBLE_ACTIVE
+    const int dle_rc = ble_gap_set_data_len(handle, 251, 2120);
+    BLE_LINK_LOG("DLE request handle=%u octets=251 time_us=2120 rc=%d", handle, dle_rc);
+#endif
+}
+
 int GapEvent(struct ble_gap_event* event, void* /*arg*/) {
     if (s_stopping) {
         if (event->type == BLE_GAP_EVENT_CONNECT && event->connect.status == 0)
@@ -1578,15 +2001,46 @@ int GapEvent(struct ble_gap_event* event, void* /*arg*/) {
             s_event_notify_enabled = false;
             s_voice_notify_enabled = false;
             s_batt_notify_enabled = false;
+#if AGENT_LINK_BLE_LINK_DIAGNOSTICS
+            s_diagnostic_cmd_notify = false; s_diagnostic_file_notify = false;
+            s_diagnostic_reading_budget = 0;
+#endif
             s_conn_handle = event->connect.conn_handle;
+            s_phy_requested=false;
             ESP_LOGI(TAG, "connected (handle=%d)", s_conn_handle.load());
+            LogConnectionParameters(event->connect.conn_handle, 0);
+            RequestVoiceConnectionParameters(event->connect.conn_handle);
             if (!s_stopping) { if (auto cb = s_on_conn.load()) cb(true); }
         } else {
             ESP_LOGW(TAG, "connect failed (status=%d) — re-advertising", event->connect.status);
             if (!s_stopping.load(std::memory_order_acquire)) StartAdvertising();
         }
         return 0;
+    case BLE_GAP_EVENT_CONN_UPDATE:
+        LogConnectionParameters(event->conn_update.conn_handle, event->conn_update.status);
+        RequestTwoMPhy(event->conn_update.conn_handle);
+        return 0;
+#ifdef BLE_GAP_EVENT_DATA_LEN_CHG
+    case BLE_GAP_EVENT_DATA_LEN_CHG:
+        BLE_LINK_LOG("DLE handle=%u tx_octets=%u tx_time_us=%u rx_octets=%u rx_time_us=%u",
+                     event->data_len_chg.conn_handle, event->data_len_chg.max_tx_octets,
+                     event->data_len_chg.max_tx_time, event->data_len_chg.max_rx_octets,
+                     event->data_len_chg.max_rx_time);
+        return 0;
+#endif
+#ifdef BLE_GAP_EVENT_PHY_UPDATE_COMPLETE
+    case BLE_GAP_EVENT_PHY_UPDATE_COMPLETE:
+        BLE_LINK_LOG("PHY handle=%u status=%d tx=%u rx=%u", event->phy_updated.conn_handle,
+                     event->phy_updated.status, event->phy_updated.tx_phy, event->phy_updated.rx_phy);
+        return 0;
+#endif
     case BLE_GAP_EVENT_DISCONNECT:
+        BLE_LINK_LOG("GAP disconnected reason=%d epoch=%u", event->disconnect.reason, unsigned(s_connection_epoch.load()));
+#if AGENT_LINK_BLE_LINK_DIAGNOSTICS && DEOTALAND_BLE_L2CAP_COC_AVAILABLE
+        BLE_LINK_LOG("CoC RX GAP totals psm81_sdus=%u psm81_bytes=%llu psm82_sdus=%u psm82_bytes=%llu",
+                     unsigned(s_coc_rx_diagnostics[0].sdus), static_cast<unsigned long long>(s_coc_rx_diagnostics[0].bytes),
+                     unsigned(s_coc_rx_diagnostics[1].sdus), static_cast<unsigned long long>(s_coc_rx_diagnostics[1].bytes));
+#endif
         s_connected = false;
         s_connection_epoch.fetch_add(1); s_acl_epoch.fetch_add(1);
         s_event_notify_enabled = false;
@@ -1654,6 +2108,15 @@ int GapEvent(struct ble_gap_event* event, void* /*arg*/) {
             if (event->subscribe.cur_notify) s_batt_dirty.store(true);
             s_control_wake.Wake();
         }
+#if AGENT_LINK_BLE_LINK_DIAGNOSTICS
+        if (event->subscribe.attr_handle == s_h_cmd) s_diagnostic_cmd_notify = event->subscribe.cur_notify;
+        if (event->subscribe.attr_handle == s_h_file) s_diagnostic_file_notify = event->subscribe.cur_notify;
+        BLE_LINK_LOG("SUBSCRIBE handle=%u reason=%u notify=%u->%u indicate=%u CCCD FFC1=%u FFC4=%u FFA1=%u Battery=%u FFB1=%u epoch=%u",
+                     event->subscribe.attr_handle, event->subscribe.reason, event->subscribe.prev_notify,
+                     event->subscribe.cur_notify, event->subscribe.cur_indicate, unsigned(s_diagnostic_cmd_notify),
+                     unsigned(s_event_notify_enabled.load()), unsigned(s_voice_notify_enabled.load()),
+                     unsigned(s_batt_notify_enabled.load()), unsigned(s_diagnostic_file_notify), unsigned(s_connection_epoch.load()));
+#endif
         return 0;
     case BLE_GAP_EVENT_ADV_COMPLETE:
         StartAdvertising();
@@ -1755,6 +2218,7 @@ void ShutdownTask(void*) {
         s_terminate_requested = false;
         s_terminate_scheduled = false;
 #if DEOTALAND_BLE_L2CAP_COC_AVAILABLE
+        ClearRxMarker();
         struct os_mbuf* pending = s_rx_pending.exchange(nullptr);
         if (pending) os_mbuf_free_chain(pending);
         s_rx_offset = 0;
@@ -1765,6 +2229,8 @@ void ShutdownTask(void*) {
         ble_npl_event_deinit(&s_rec_send.event);
         ble_npl_event_deinit(&s_img_send.event);
         ble_npl_event_deinit(&s_rearm_event);
+        ble_npl_event_deinit(&s_rx_marker_event);
+        s_rx_marker_scheduled=false;
         s_rearm_scheduled = false;
         s_rearm_retry = false;
 #endif
@@ -1840,7 +2306,16 @@ esp_err_t InitHost() {
 }
 
 esp_err_t ble_start(void* /*impl*/) {
+#if AGENT_LINK_BLE_LINK_DIAGNOSTICS
+    esp_log_level_set(TAG, ESP_LOG_INFO);
+#endif
     if (s_started.load()) return ESP_ERR_INVALID_STATE;
+    // Reserve before creating any worker or publishing callbacks. Allocation
+    // failure must reject startup, not turn later commands into silent drops.
+    if (!s_control_q.prepare()) {
+        ESP_LOGE(TAG, "control queue allocation failed (%u bytes)", unsigned(sizeof(ControlQueue)));
+        return ESP_ERR_NO_MEM;
+    }
     s_stopping.store(false);
     s_control_wake.Init(); s_voice_wake.Init(); s_shutdown_wake.Init();
 #if DEOTALAND_BLE_L2CAP_COC_AVAILABLE
@@ -1887,6 +2362,7 @@ esp_err_t ble_start(void* /*impl*/) {
     ble_npl_event_init(&s_rec_send.event, SendL2capHost, &s_rec_send);
     ble_npl_event_init(&s_img_send.event, SendL2capHost, &s_img_send);
     ble_npl_event_init(&s_rearm_event, RearmL2capHost, nullptr);
+    ble_npl_event_init(&s_rx_marker_event, RxMarkerHost, nullptr);
 #endif
     s_control_running.store(true);
     if (xTaskCreate(ControlTask, "agentlink_ctrl", 4096, nullptr, 6, nullptr) != pdPASS) {
@@ -1899,6 +2375,7 @@ esp_err_t ble_start(void* /*impl*/) {
         ble_npl_event_deinit(&s_rec_send.event);
         ble_npl_event_deinit(&s_img_send.event);
         ble_npl_event_deinit(&s_rearm_event);
+        ble_npl_event_deinit(&s_rx_marker_event);
 #endif
         (void)nimble_port_deinit();
         return ESP_ERR_NO_MEM;
@@ -1964,11 +2441,17 @@ esp_err_t ble_stream_start(void*, agent_stream_t type, const uint8_t* meta, size
     if (type == AGENT_STREAM_AUDIO) return RecordingStart(reinterpret_cast<const char*>(meta), meta_len);
     if (type == AGENT_STREAM_IMAGE) {
         if (!meta || meta_len != 9) return ESP_ERR_INVALID_ARG;
+        uint8_t format;
+        switch (meta[0]) {
+        case AGENT_ENC_JPEG: format = kImgWireJpeg; break;
+        case AGENT_ENC_RAW: format = kImgWireRgb565; break;
+        default: return ESP_ERR_NOT_SUPPORTED;
+        }
         const uint16_t w = meta[1] | (static_cast<uint16_t>(meta[2]) << 8);
         const uint16_t h = meta[3] | (static_cast<uint16_t>(meta[4]) << 8);
         const uint32_t total = static_cast<uint32_t>(meta[5]) | (static_cast<uint32_t>(meta[6]) << 8) |
                               (static_cast<uint32_t>(meta[7]) << 16) | (static_cast<uint32_t>(meta[8]) << 24);
-        return ImageStart(meta[0], w, h, total);
+        return ImageStart(format, w, h, total);
     }
 #else
     (void)meta; (void)meta_len;

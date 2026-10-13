@@ -1,8 +1,10 @@
-// The user's AIOT-Basic has an independent I2S amplifier and two-wire PDM mic.
+// AIOT-Basic has an independent I2S amplifier and digital microphone.
 // No codec I2C, external MCLK or PA GPIO is used. GPIO46 remains free for SD CS.
-// I2S0 provides hardware PDM->PCM; I2S1 independently drives standard I2S TX.
+// I2S0 captures standard I2S32 by default, or PDM on an explicitly selected
+// two-wire variant. I2S1 independently drives standard I2S TX.
 // API basis: https://docs.espressif.com/projects/esp-idf/en/v5.5.3/esp32s3/api-reference/peripherals/i2s.html
 #include "BoardAudio.h"
+#include "BoardConfig.h"
 
 #include <atomic>
 #include <cstring>
@@ -28,12 +30,19 @@ constexpr uint32_t kSampleRate = 16000;
 constexpr TickType_t kWorkerDelay = pdMS_TO_TICKS(2) ? pdMS_TO_TICKS(2) : 1;
 constexpr TickType_t kJoinDelay = pdMS_TO_TICKS(1) ? pdMS_TO_TICKS(1) : 1;
 constexpr gpio_num_t kBclk = GPIO_NUM_39, kWs = GPIO_NUM_40, kDout = GPIO_NUM_38;
-constexpr gpio_num_t kPdmClk = GPIO_NUM_41, kPdmDin = GPIO_NUM_2;
+constexpr gpio_num_t kMicClk = GPIO_NUM_41, kMicDin = GPIO_NUM_2;
+#if !AIOT_MIC_USE_PDM
+constexpr gpio_num_t kMicWs = GPIO_NUM_42;
+// MSM261S4030H0R outputs signed, MSB-first 24-bit data in a 32-bit I2S slot.
+// Keep the high 16 bits without filtering, unsigned reinterpretation or gain.
+constexpr int16_t MicPcm16(int32_t raw) { return static_cast<int16_t>(raw >> 16); }
+#endif
 }
 
 struct BoardAudio::Impl {
     struct Stage { int16_t stereo[kSamples * 2]; size_t monoBytes = 0; } stages[kStages];
-    struct Capture { int16_t mono[kSamples]; uint32_t epoch = 0; } capture[kCapturePackets];
+    struct Capture { int16_t mono[kSamples]; uint32_t epoch = 0; };
+    Capture* capture = nullptr; // Internal RAM, reserved only when RX is requested.
     struct Dma { void* address = nullptr; size_t monoBytes = 0; uint32_t epoch = 0; } dma[kDmaBuffers];
     // All state used by the ISR, including its staging buffers, stays in SRAM.
     portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
@@ -74,7 +83,7 @@ struct BoardAudio::Impl {
             portEXIT_CRITICAL(&mux);
             if (cancel) {
                 // Independent I2S1: stop DMA before touching its buffers. The
-                // PDM receiver on I2S0 continues without losing its clocks.
+                // Microphone RX on I2S0 continues without losing its clocks.
                 esp_err_t e = i2s_channel_disable(tx);
                 if (e != ESP_OK) { fault("cancel TX stop",e); break; }
                 txEnabled = false;
@@ -131,6 +140,14 @@ struct BoardAudio::Impl {
 
     void receive() {
         int16_t mono[kSamples];
+#if AIOT_MIC_USE_PDM
+        uint8_t* const input = reinterpret_cast<uint8_t*>(mono);
+        constexpr size_t inputBytes = kMonoBytes, sampleBytes = sizeof(int16_t);
+#else
+        int32_t raw[kSamples];
+        uint8_t* const input = reinterpret_cast<uint8_t*>(raw);
+        constexpr size_t inputBytes = sizeof(raw), sampleBytes = sizeof(int32_t);
+#endif
         uint32_t observedEpoch = 0;
         size_t accumulated = 0;
         while (!stopping.load(std::memory_order_acquire)) {
@@ -152,20 +169,25 @@ struct BoardAudio::Impl {
                 accumulated = 0; observedEpoch = epoch;
             }
             size_t got = 0;
-            const esp_err_t e = i2s_channel_read(rx,reinterpret_cast<uint8_t*>(mono) + accumulated,
-                                                kMonoBytes - accumulated,&got,40);
+            const esp_err_t e = i2s_channel_read(rx,input + accumulated,
+                                                inputBytes - accumulated,&got,40);
             if (e != ESP_OK && e != ESP_ERR_TIMEOUT) {
                 portENTER_CRITICAL(&mux); ++captureDrops; portEXIT_CRITICAL(&mux);
                 fault("capture read",e); break;
             }
-            if ((got & 1u) || got > kMonoBytes - accumulated) {
+            if ((got % sampleBytes) || got > inputBytes - accumulated) {
                 portENTER_CRITICAL(&mux); ++captureDrops; portEXIT_CRITICAL(&mux);
-                accumulated = 0; continue;
+                // Reset the SDK read pointer too; skipping an odd byte alone
+                // would leave every later PCM word shifted out of alignment.
+                accumulated = 0; observedEpoch = epoch - 1; continue;
             }
             accumulated += got;
-            if (accumulated != kMonoBytes) continue;
+            if (accumulated != inputBytes) continue;
             accumulated = 0;
             if (!enabled) continue; // drain DMA continuously while capture is off
+#if !AIOT_MIC_USE_PDM
+            for (size_t i = 0; i < kSamples; ++i) mono[i] = MicPcm16(raw[i]);
+#endif
             xSemaphoreTake(captureMutex,portMAX_DELAY);
             portENTER_CRITICAL(&mux);
             const bool current = captureEnabled && captureEpoch == observedEpoch;
@@ -199,6 +221,7 @@ struct BoardAudio::Impl {
         if (rx) { if (i2s_del_channel(rx) != ESP_OK) return false; rx = nullptr; }
         if (tx) { if (i2s_del_channel(tx) != ESP_OK) return false; tx = nullptr; }
         if (ring) { heap_caps_free(ring); ring = nullptr; }
+        if (capture) { heap_caps_free(capture); capture = nullptr; }
         if (captureMutex) vSemaphoreDelete(captureMutex);
         if (ringMutex) vSemaphoreDelete(ringMutex);
         return true;
@@ -255,18 +278,23 @@ BoardAudio::~BoardAudio() {
     if (impl_ && impl_->release()) { impl_->~Impl(); heap_caps_free(impl_); }
 }
 
-esp_err_t BoardAudio::begin() {
+esp_err_t BoardAudio::begin(bool enableCapture) {
     if (impl_) return ESP_ERR_INVALID_STATE;
     void* memory = heap_caps_malloc(sizeof(Impl),MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!memory) return ESP_ERR_NO_MEM;
     impl_ = new (memory) Impl();
     auto& s = *impl_;
     s.ringMutex = xSemaphoreCreateMutexStatic(&s.ringMutexStorage);
-    s.captureMutex = xSemaphoreCreateMutexStatic(&s.captureMutexStorage);
+    if (enableCapture) {
+        s.captureMutex = xSemaphoreCreateMutexStatic(&s.captureMutexStorage);
+        s.capture = static_cast<Impl::Capture*>(heap_caps_malloc(kCapturePackets * sizeof(Impl::Capture),
+                                                               MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        if (s.capture) for (size_t i = 0; i < kCapturePackets; ++i) new (s.capture + i) Impl::Capture();
+    }
     // No silently smaller capacity: absence of configured PSRAM is a startup error.
     s.ring = static_cast<uint8_t*>(heap_caps_malloc(kPlaybackBytes,MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     esp_err_t e = ESP_OK;
-    if (!s.ring || !s.ringMutex || !s.captureMutex) e = ESP_ERR_NO_MEM;
+    if (!s.ring || !s.ringMutex || (enableCapture && (!s.captureMutex || !s.capture))) e = ESP_ERR_NO_MEM;
     i2s_chan_config_t channel = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1,I2S_ROLE_MASTER);
     channel.dma_desc_num = kDmaBuffers; channel.dma_frame_num = kSamples;
     channel.auto_clear_before_cb = true; channel.auto_clear_after_cb = false;
@@ -281,20 +309,36 @@ esp_err_t BoardAudio::begin() {
     if (e == ESP_OK) e = i2s_channel_init_std_mode(s.tx,&standard);
     channel.id = I2S_NUM_0;
     channel.auto_clear_before_cb = false;
-    if (e == ESP_OK) e = i2s_new_channel(&channel,nullptr,&s.rx);
+    if (e == ESP_OK && enableCapture) e = i2s_new_channel(&channel,nullptr,&s.rx);
+#if AIOT_MIC_USE_PDM
     i2s_pdm_rx_config_t pdm = {};
     pdm.clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(kSampleRate);
     pdm.slot_cfg = I2S_PDM_RX_SLOT_PCM_FMT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,I2S_SLOT_MODE_MONO);
-    pdm.gpio_cfg.clk = kPdmClk; pdm.gpio_cfg.din = kPdmDin;
-    if (e == ESP_OK) e = i2s_channel_init_pdm_rx_mode(s.rx,&pdm);
+    pdm.slot_cfg.slot_mask = AIOT_MIC_RIGHT_CHANNEL ? I2S_PDM_SLOT_RIGHT : I2S_PDM_SLOT_LEFT;
+    pdm.gpio_cfg.clk = kMicClk; pdm.gpio_cfg.din = kMicDin;
+    if (e == ESP_OK && enableCapture) e = i2s_channel_init_pdm_rx_mode(s.rx,&pdm);
+#else
+    i2s_std_config_t microphone = {};
+    microphone.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(kSampleRate);
+    microphone.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT,I2S_SLOT_MODE_MONO);
+    microphone.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT;
+    microphone.slot_cfg.slot_mask = AIOT_MIC_RIGHT_CHANNEL ? I2S_STD_SLOT_RIGHT : I2S_STD_SLOT_LEFT;
+    // STD always clocks two physical slots, even with one active DMA slot:
+    // 32 SCK per WS half-period, 64 per frame, BCLK=1.024MHz at 16kHz.
+    microphone.slot_cfg.ws_width = 32;
+    microphone.gpio_cfg.mclk = I2S_GPIO_UNUSED;
+    microphone.gpio_cfg.bclk = kMicClk; microphone.gpio_cfg.ws = kMicWs;
+    microphone.gpio_cfg.dout = I2S_GPIO_UNUSED; microphone.gpio_cfg.din = kMicDin;
+    if (e == ESP_OK && enableCapture) e = i2s_channel_init_std_mode(s.rx,&microphone);
+#endif
     i2s_event_callbacks_t callbacks = {};
     callbacks.on_sent = Impl::sent;
     if (e == ESP_OK) e = i2s_channel_register_event_callback(s.tx,&callbacks,&s);
     callbacks = {};
     callbacks.on_recv_q_ovf = Impl::overflow;
-    if (e == ESP_OK) e = i2s_channel_register_event_callback(s.rx,&callbacks,&s);
+    if (e == ESP_OK && enableCapture) e = i2s_channel_register_event_callback(s.rx,&callbacks,&s);
     if (e == ESP_OK) { e = i2s_channel_enable(s.tx); s.txEnabled = e == ESP_OK; }
-    if (e == ESP_OK) { e = i2s_channel_enable(s.rx); s.rxEnabled = e == ESP_OK; }
+    if (e == ESP_OK && enableCapture) { e = i2s_channel_enable(s.rx); s.rxEnabled = e == ESP_OK; }
     // Publish before launching workers: an early worker fault must be able to
     // clear readiness without begin() subsequently overwriting that fault.
     if (e == ESP_OK) s.usable.store(true,std::memory_order_release);
@@ -304,7 +348,7 @@ esp_err_t BoardAudio::begin() {
             s.txStopped.store(true); e = ESP_ERR_NO_MEM;
         }
     }
-    if (e == ESP_OK) {
+    if (e == ESP_OK && enableCapture) {
         s.rxStopped.store(false);
         if (xTaskCreate([](void* p){ static_cast<Impl*>(p)->receive(); },"aiot_pcm_rx",6144,&s,5,&s.rxTask) != pdPASS) {
             s.rxStopped.store(true); e = ESP_ERR_NO_MEM;
@@ -316,14 +360,16 @@ esp_err_t BoardAudio::begin() {
         if (s.release()) { s.~Impl(); heap_caps_free(impl_); impl_ = nullptr; }
         return e;
     }
-    ESP_LOGI(kTag,"I2S1 amp + I2S0 PDM mic: 16000 Hz mono, volume60, 64KiB PSRAM playback");
+    ESP_LOGI(kTag,"I2S1 amp, mic=%s: 16000 Hz mono, volume60, 64KiB PSRAM playback",
+             enableCapture ? (AIOT_MIC_USE_PDM ? "PDM" : "I2S32") : "disabled");
     return ESP_OK;
 }
 
 bool BoardAudio::ready() const { return impl_ && impl_->usable.load(std::memory_order_acquire); }
+bool BoardAudio::captureReady() const { return ready() && impl_->rx && impl_->capture; }
 
 void BoardAudio::setCapture(bool enabled) {
-    if (!ready()) return;
+    if (!captureReady()) return;
     auto& s = *impl_;
     portENTER_CRITICAL(&s.mux);
     if (s.captureEnabled != enabled) { s.captureEnabled = enabled; ++s.captureEpoch; }
@@ -331,7 +377,7 @@ void BoardAudio::setCapture(bool enabled) {
 }
 
 size_t BoardAudio::readCapture(uint8_t* destination, size_t capacity) {
-    if (!ready() || !destination || capacity < 2) return 0;
+    if (!captureReady() || !destination || capacity < 2) return 0;
     auto& s = *impl_;
     if (xSemaphoreTake(s.captureMutex,0) != pdTRUE) return 0;
     portENTER_CRITICAL(&s.mux);

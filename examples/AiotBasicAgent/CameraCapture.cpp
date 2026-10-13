@@ -5,11 +5,19 @@
 
 #if DEOTALAND_CAMERA_AVAILABLE
 #include <Arduino.h>
+#include "BoardTasks.h"
 #include "driver/i2c_master.h"
 #include "esp_camera.h"
 #include "esp_heap_caps.h"
+#include "esp_log.h"
 #include "img_converters.h"
 #include "camera_pins.h"
+
+#if AIOT_CAMERA_PSRAM_DMA
+// Optional in older Arduino camera bundles. A weak reference keeps those
+// bundles buildable and preserves their ordinary internal DMA path.
+extern "C" esp_err_t esp_camera_set_psram_mode(bool enable) __attribute__((weak));
+#endif
 
 esp_err_t CameraCapture::begin() {
   if (worker_) return ESP_ERR_INVALID_STATE;
@@ -63,6 +71,20 @@ esp_err_t CameraCapture::begin() {
     config.fb_location = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
     config.grab_mode = CAMERA_GRAB_LATEST;
     result = esp_camera_init(&config);
+#if AIOT_CAMERA_PSRAM_DMA
+    if (result == ESP_OK && psramFound() && esp_camera_set_psram_mode) {
+      // The public API reinitializes the driver. No frame or worker is yet
+      // published, and SCCB reuses our externally owned I2C0 bus. Apply all
+      // sensor adjustments only after this transition has completed.
+      result = esp_camera_set_psram_mode(true);
+      if (result != ESP_OK) {
+        ESP_LOGW("AIOT.Camera", "PSRAM DMA unavailable; restoring normal capture");
+        (void)esp_camera_deinit();
+        (void)esp_camera_set_psram_mode(false);
+        result = esp_camera_init(&config);
+      }
+    }
+#endif
     cameraInitialized = result == ESP_OK;
     if (cameraInitialized) {
       sensor_t* sensor = esp_camera_sensor_get();
@@ -81,7 +103,7 @@ esp_err_t CameraCapture::begin() {
         }
       }
       if (result == ESP_OK &&
-          xTaskCreate(workerEntry, "aiot_camera", 8192, this, 1, &worker_) != pdPASS)
+          aiotCreateBackgroundTask(workerEntry, "aiot_camera", 8192, this, 1, &worker_) != pdPASS)
         result = ESP_ERR_NO_MEM;
     }
   }

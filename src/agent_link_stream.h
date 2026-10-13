@@ -11,7 +11,7 @@
  *
  *          The @ref agent_stream_t kind is the only thing that varies. The transport decides how
  *          that kind travels (BLE uses GATT notifications for one kind and separate L2CAP
- *          channels for the others; a WiFi backend would use different tracks), and it owns
+ *          channels for the others), and it owns
  *          session ids, framing, slicing and backpressure. Callers just hand over bytes.
  *
  *          The SDK does not interpret those bytes. It will not encode, transcode or compress —
@@ -59,7 +59,7 @@ typedef enum {
     /** A still image. */
     AGENT_STREAM_IMAGE,
 
-    /** Encoded video frames. Needs the bandwidth of a WiFi transport. */
+    /** Encoded video frames. Unsupported by the built-in BLE backend. */
     AGENT_STREAM_VIDEO,
 
     /** An arbitrary file from the device's storage. */

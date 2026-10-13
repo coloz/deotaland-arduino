@@ -4,7 +4,9 @@
 #include <cstdint>
 #include <esp_err.h>
 
-// ESP32-S3 AIOT-Basic: PDM microphone + I2S amplifier, PCM16/mono/16 kHz.
+// ESP32-S3 AIOT-Basic: digital microphone + I2S amplifier, PCM16/mono/16 kHz.
+// BoardConfig.h selects standard I2S32 RX (default) or confirmed PDM hardware,
+// and the physical left/right microphone slot. No DC/gain filter hides input.
 // Use one long-lived instance. Public methods belong to the Arduino loop thread;
 // capture/playback transfers return immediately and may accept fewer bytes.
 // begin() and destruction perform driver operations, so call them outside
@@ -16,8 +18,10 @@ public:
     BoardAudio(const BoardAudio&) = delete;
     BoardAudio& operator=(const BoardAudio&) = delete;
 
-    esp_err_t begin();
+    // Playback remains available when capture is disabled to save internal RAM.
+    esp_err_t begin(bool enableCapture = true);
     bool ready() const;
+    bool captureReady() const;
     // A transition discards old capture packets and restarts only RX DMA.
     void setCapture(bool enabled);
     size_t readCapture(uint8_t* destination, size_t capacity);

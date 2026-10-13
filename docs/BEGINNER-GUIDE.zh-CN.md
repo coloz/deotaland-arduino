@@ -1,20 +1,20 @@
 # 中文入门指南
 
-适用库版本：**0.8.1**；核对日期：2026-10-11。内容对应当前源码和示例。文中的 Core 版本是已验证的编译基线，不表示只有该版本可用，也不表示它是当前最新 Core。
+适用库版本：**0.9.3**；核对日期：2026-10-13。内容对应当前源码和示例。文中的 Core 版本是已验证的编译基线，不表示只有该版本可用，也不表示它是当前最新 Core。
 
-BLE 路线先看到 READY 和一条模拟读数，再接入真实传感器；Wi-Fi 路线先连接路由器取得 IP，再配置云端激活。你可以直接从第 6 节开始使用 Wi-Fi，不需要先做 BLE 配对。
+先看到 READY 和一条模拟读数，再接入真实传感器。所有内置连接与媒体示例均使用 BLE。
 
 ## 1. 准备与安装
 
-准备可传数据的 USB 线和 Arduino IDE，再按路线选择开发板：BLE 练习需要有 BLE 控制器的 ESP32 及兼容 Agent Link 的 App；Wi-Fi 练习需要有 Wi-Fi 的 ESP32 和可连接的路由器，BasicWiFi 不需要 BLE 或 Agent Link App。本文的编译基线是 ESP32-S3 + Arduino-ESP32 3.3.12。库的便携核心还能用于 STM32 自定义传输，但那需要自行实现桥接，不适合作为第一课。
+准备可传数据的 USB 线和 Arduino IDE、有 BLE 控制器的 ESP32 及兼容 Agent Link 的 App。本文的编译基线是 ESP32-S3 + Arduino-ESP32 3.3.12，随 Core 提供的 SDK 为 ESP-IDF 5.5.5。库的便携核心还能用于 STM32 自定义传输，但那需要自行实现桥接，不适合作为第一课。
 
-在开发板管理器安装 Espressif 的 `esp32` Core，再安装本库。0.8.1 内置固定版本的 NimBLE-Arduino 源码，默认启用两个 CoC 通道，不需要另装 NimBLE-Arduino、修改 Core 配置或重编译 SDK。一个固件由本库管理 BLE 栈；不要再初始化 BLEDevice 或另一个 NimBLEDevice 栈。
+在开发板管理器安装 Espressif 的 `esp32` Core，再安装本库。0.9.3 内置固定版本的 NimBLE-Arduino 源码，默认启用两个 CoC 通道，不需要另装 NimBLE-Arduino、修改 Core 配置或重编译 SDK。一个固件由本库管理 BLE 栈；不要再初始化 BLEDevice 或另一个 NimBLEDevice 栈。
 
 用“Sketch → Include Library → Add .ZIP Library”选择安装包。手动安装时目录应是 `Sketchbook/libraries/deotaland-arduino/src/Deotaland.h`，而不是多套一层同名目录。重开 IDE，从 File → Examples 找到本库。[官方安装说明](https://support.arduino.cc/hc/en-us/articles/5145457742236-Install-libraries-in-the-Arduino-IDE)
 
-安装后确认 `library.properties` 中的 `version=0.8.1`。若找不到 `DeotalandImageUpload`、`updateFloat` 或 `status().wifi_connected`，查看 IDE 详细编译输出采用的库路径，排除旧副本。`config.firmware_rev` 是你自己的设备固件版本，不必跟随库版本填写。
+安装后确认 `library.properties` 中的 `version=0.9.3`。若找不到 `DeotalandImageUpload`、`updateFloat`，查看 IDE 详细编译输出采用的库路径，排除旧副本。`config.firmware_rev` 是你自己的设备固件版本，不必跟随库版本填写。
 
-选择与你的实际芯片一致的板型、端口、Flash 大小和分区。完整构建含 TLS，默认的小应用分区可能放不下；本次 S3 编译使用 `min_spiffs`，应用槽 1,966,080 字节并保留双槽。按实际 Flash 选择，不能为了通过编译虚填容量。[Espressif 工具菜单](https://docs.espressif.com/projects/arduino-esp32/en/latest/guides/tools_menu.html)
+选择与你的实际芯片一致的板型、端口、Flash 大小和分区。完整 BLE 与媒体固件需要足够的应用分区；本次 S3 编译使用 `min_spiffs`，应用槽 1,966,080 字节并保留双槽。按实际 Flash 选择，不能为了通过编译虚填容量。[Espressif 工具菜单](https://docs.espressif.com/projects/arduino-esp32/en/latest/guides/tools_menu.html)
 
 若用 S3 的原生 USB 口看 `Serial`，按板卡配置启用 `USB CDC On Boot`；若用 CH340/CP210x 等转串口芯片，应选对应端口，不能套用原生 USB 设置。打开监视器选 115200。原生 USB 首次烧录后可能需要复位并重新选择端口。[Espressif USB CDC 指南](https://docs.espressif.com/projects/arduino-esp32/en/latest/tutorials/cdc_dfu_flash.html)
 
@@ -68,46 +68,7 @@ BLE 路线先看到 READY 和一条模拟读数，再接入真实传感器；Wi-
 
 示例每 100ms 尝试一次，只在拥塞时重试；断线或等待超过 5 秒取消。它不会在 `while` 中反复发送，也不会把旧提示词留到新连接。发送成功意味着本地接受，实际 Agent 回复需要 App 和平台业务链路正常。
 
-## 6. Wi-Fi、语音和图片什么时候开始
-
-**填写账号密码直接连接：** 打开 [BasicWiFi](../examples/BasicWiFi/BasicWiFi.ino)，修改顶部的 `kSsid` 和 `kPassword`，上传后打开 115200 串口。看到 `Wi-Fi 已连接，IP: ...` 即表示已连上路由器；串口 `?` 可随时查询。示例使用下面两个配置字段，不要同时调用其他库的 `WiFi.begin()`：
-
-```cpp
-agent_wifi_config_t wifi = {"你的 Wi-Fi 名称", "你的 Wi-Fi 密码"};
-agent_link_config_t config = {};
-config.device_name = "Deotaland-WiFi";
-config.transport = AGENT_TRANSPORT_WIFI;
-config.wifi = &wifi;
-// setup 中调用并检查 Deotaland.begin(config)，loop 中持续 Deotaland.poll()。
-```
-
-`begin` 成功表示后台任务已启动，不代表已获取 IP。0.6.1 起，无需配置云平台也能通过 `status()` 区分配网、连接中和已联网。持续 `poll()` 后读取：
-
-```cpp
-const auto status = Deotaland.status();
-if (status.wifi_connected) Serial.println(status.wifi_ip); // 路由器分配的 IP
-if (status.wifi_portal_active) Serial.println(status.hint); // 实际配网热点提示
-```
-
-无平台配置、已获取 IP 且配网门户已关闭时，阶段为 `AGENT_LINK_PHASE_NETWORK_READY`。这是网络已连接，不是 Agent 数据通道 READY；仅有 IP 也不保证互联网或云端可达。断网后库会清空 IP，BasicWiFi 无需自行注册 ESP-IDF 事件监听器。
-
-| 看到的阶段/字段 | 含义与操作 |
-| --- | --- |
-| CONNECTING / Joining WiFi | 尚未获取 IP，持续 poll，检查 SSID、密码和网络 |
-| SETUP / wifi_portal_active=true | 配网门户已启动，按 hint 中的热点名称连接 |
-| NETWORK_READY / WiFi connected | 本例连接路由器的目标已完成，可读取 wifi_ip |
-| CONNECTED / Platform online | 已配置平台且鉴权在线；仍没有 Wi-Fi 控制/媒体数据通道 |
-| BLOCKED | 查看 title/hint/detail，区分后台 Wi-Fi 服务错误与平台错误 |
-
-配网成功后的短暂收尾期间，`wifi_connected` 和 `wifi_portal_active` 可以同时为 true，阶段仍为 SETUP；这是两个独立状态。BasicWiFi 每 5 秒重复诊断，`?` 可主动查询，连续查询也会限频。
-
-[WiFiProvisioning](../examples/WiFiProvisioning/WiFiProvisioning.ino) 用于配网，无保存凭据时打开 `Deotaland-WiFi-XXXX` 热点。手机若提示无互联网，保持此连接；门户没弹出时打开 `http://192.168.4.1/`，若网关被板级配置修改则以实际网关为准。不要同时让 `WiFi.begin()` 和本库争用同一个驱动。
-
-**换网时注意凭据优先级：** 草图中非空的 `config.wifi->ssid` 每次启动都优先于 NVS 保存值。用配网页换网后，若草图仍写着旧 SSID，重启会再次尝试旧网络；更新草图，或改用不预设凭据的 WiFiProvisioning。开放网络的密码填 `""`，不要保留 `YOUR_WIFI_PASSWORD` 占位符。
-
-[CloudActivation](../examples/CloudActivation/CloudActivation.ino) 需要你部署/使用的平台参数。示例域名和 product ID 是占位符。激活成功也不会让 Wi-Fi 的 `isReady()` 变 true：当前只完成激活、绑定、鉴权和心跳，尚无控制/音视频数据通道。
-
-CloudActivation 默认使用已保存凭据或热点配网；若希望它也预设 SSID/密码，把上面 `wifi` 和 `config.wifi = &wifi` 加到其 setup 的 begin 之前。不要假设 BasicWiFi 中写在固件里的凭据一定已持久化到 NVS。
+## 6. 语音和图片什么时候开始
 
 语音/图片示例放在控制链路练习之后。VOICE 使用 GATT，但测试程序产生的是合成音；AUDIO、IMAGE、TTS 和 OTA 使用内置 CoC 栈，仍要求 App 打开相应通道。VoicePTT、RealtimeASR、ImageStream、BufferedPlayback 会在启动后检查所需能力，每 10 秒或输入 `?` 可重新查看诊断。库不会替你选择 I2S、摄像头或扬声器引脚。每个进阶示例的替换点见 [索引](../examples/README.zh-CN.md)。
 
@@ -126,19 +87,17 @@ CloudActivation 默认使用已保存凭据或热点配网；若希望它也预�
 
 | 现象 | 先检查与处理 |
 | --- | --- |
-| 找不到头文件、新方法或 Wi-Fi 状态字段 | 检查库目录结构、实际编译路径及 0.8.1 版本 |
+| 找不到头文件或新方法 | 检查库目录结构、实际编译路径及 0.9.3 版本 |
 | Sketch too big | 按真实 Flash 容量选择足够大的应用分区，参考第 1 节 |
 | 上传后串口空白 | 检查板卡对应的 USB/CDC、端口、115200；打开串口后复位或等待周期诊断 |
 | begin / streamStatus 返回 NOT_SUPPORTED | 检查芯片、Core、所选传输与 CoC 支持；不能靠重试补齐能力 |
 | BLE 一直 CONNECTED | App 需订阅事件特征 0xFFC4；READY 后媒体仍可能等待各自通道 |
 | updateXXX 成功但没有读数 | 检查端点 ID/方向/类型、持续 poll、App 的上报策略和当前包容量 |
 | 提示词/读数过长 | 按 UTF-8 字节检查 maxPromptBytes 与 MTU；读数还占用 ID 字节数加 2 字节 |
-| Wi-Fi 不知道是否连上或找不到热点 | 查 wifi_connected、wifi_ip、wifi_portal_active 和 title/hint，不用 isReady 判断路由器连接 |
-| Wi-Fi 在线但 isReady=false | 尚无 Wi-Fi 控制/媒体数据通道；当前支持联网、配网与平台激活/鉴权/心跳 |
 | 相机图片无法上传 | 看 CameraSnapshot 诊断，确认 PSRAM/接线、IMAGE 能力、App 的 CoC 0x0082 通道及上传返回值 |
 | 没声音或识别为噪声 | VoicePTT/RealtimeASR 默认是合成测试音；BufferedPlayback 无扬声器驱动，需按真实硬件接入 |
 | 重连后旧 stream 句柄报错 / duplicate id | 重新打开当前会话的流；I/O 端点不要每次连接重复注册，变更配置时才 reset |
 
-先检查本次 API 返回值，再看 `state()/isReady()` 或 Wi-Fi 网络字段。`stats().last_error` 是最近一次记录的历史错误，成功不会自动清零；它不代表当前连接必然失败。不要在日志中输出 Wi-Fi 密码、平台密钥或完整私密提示词。
+先检查本次 API 返回值，再看 `state()/isReady()` 及 `status()`。`stats().last_error` 是最近一次记录的历史错误，成功不会自动清零；它不代表当前连接必然失败。不要在日志中输出完整私密提示词。
 
-CameraSnapshot 已提供设备端采集、编码和上传流程；相机板与配套 App 尚未完成实机联调，真实收图与长期稳定性仍需实测，Wi-Fi 业务数据通道仍未实现。API 的预算、内存、媒体流、OTA 和自定义传输约定见 [进阶参考](REFERENCE.zh-CN.md)。
+ESP32-S3 AIOT-Basic 与 RoRoLee Android 3.4.2 已完成一次 BLE 拍照请求、JPEG 收图和画面描述验收，见[硬件实测记录](HARDWARE-VALIDATION.zh-CN.md)。该结果不代替其他板卡、RAW 或持续图片上传的验收。API 的预算、内存、媒体流、OTA 和自定义传输约定见 [进阶参考](REFERENCE.zh-CN.md)。

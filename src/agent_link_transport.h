@@ -8,7 +8,6 @@
 extern "C" {
 #endif
 struct agent_link_status_s;
-struct agent_platform_s;
 
 // RX data is copied before returning. Full queue -> ESP_ERR_NO_MEM; retry later.
 // Non-ESP32 adapters call these from poll(), not from interrupts or other threads.
@@ -27,8 +26,7 @@ typedef struct {
  * @brief Transport backend operation table
  * @note start/stop/send_ctrl/is_ready/bind are required for custom backends.
  *       Stream functions are optional as a complete set; NULL means unsupported.
- *       Control plane is reliable but low‑bandwidth (GATT, WS, MQTT)
- *       Data plane is high‑throughput (L2CAP, WebRTC)
+ *       BLE control plane uses GATT; bulk media use L2CAP CoC.
  */
 typedef struct agent_transport_s {
     /**
@@ -181,50 +179,6 @@ void agent_transport_ble_set_device_info(const char* manufacturer, const char* m
  *       Called by the core when battery changes.
  */
 void agent_transport_ble_update_battery(uint8_t percent);
-
-/**
- * @brief Get the WiFi transport instance.
- * @return Pointer to the WiFi transport operation table.
- */
-agent_transport_t* agent_transport_wifi(void);
-
-/** Forward declaration of WiFi config structure (defined in agent_link.h). */
-struct agent_wifi_config_s;
-
-/**
- * @brief Set WiFi connection parameters.
- * @param cfg Pointer to the WiFi configuration structure.
- * @note Called by agent_link_init() to pass the wifi config.
- */
-void agent_transport_wifi_set_config(const struct agent_wifi_config_s* cfg);
-void agent_transport_wifi_set_platform(const struct agent_platform_s* platform, const char* firmware);
-void agent_transport_wifi_set_status(void (*cb)(const struct agent_link_status_s*));
-esp_err_t agent_transport_wifi_forget(void);
-bool agent_transport_wifi_active(void);
-
-/** Set the device name used as the SoftAP SSID prefix for WiFi provisioning. */
-void agent_transport_wifi_set_name(const char* name);
-
-/**
- * @brief Register callback for incoming control frames.
- * @param cb Function called when a control message is received (WS/DataChannel).
- * @note Called by agent_link_init() to wire the core's OnCtrlFrame.
- */
-void agent_transport_wifi_set_recv(void (*cb)(const uint8_t* data, size_t len));
-
-/**
- * @brief Register callback for connection state changes.
- * @param cb Function called when WiFi connects or disconnects.
- * @note Called by agent_link_init() to wire the core's OnConn.
- */
-void agent_transport_wifi_set_conn(void (*cb)(bool connected));
-
-/**
- * @brief Register callback for incoming data-plane data.
- * @param cb Function called when a data chunk arrives (e.g., WebRTC audio/video).
- * @note Called by agent_link_init() to wire the core's OnStreamData.
- */
-void agent_transport_wifi_set_stream_recv(void (*cb)(agent_stream_t type, const uint8_t* data, size_t len));
 
 #ifdef __cplusplus
 }

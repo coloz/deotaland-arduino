@@ -10,7 +10,7 @@
 4. App 订阅设备事件 `0xFFC4`，并打开 IMAGE CoC `PSM 0x0082`。READY 表示控制就绪，不能代替图片通道就绪。
 5. 接入相机时使用 [CameraSnapshot](../examples/CameraSnapshot/CameraSnapshot.ino)，核对引脚、PSRAM 类型、Flash 容量和应用分区。
 
-一个固件由本库管理 BLE 控制器和主机生命周期。草图包含 `Deotaland.h` 即可；不要同时初始化 `BLEDevice`、另一套 `NimBLEDevice` 或其他 BLE 主机。单独安装 NimBLE-Arduino 不是本库的依赖；vendored 主机属于库的私有实现。Wi-Fi 继续使用官方 Core 驱动。
+一个固件由本库管理 BLE 控制器和主机生命周期。草图包含 `Deotaland.h` 即可；不要同时初始化 `BLEDevice`、另一套 `NimBLEDevice` 或其他 BLE 主机。单独安装 NimBLE-Arduino 不是本库的依赖；vendored 主机属于库的私有实现。
 
 ESP32-S2 等没有 BLE 控制器的芯片仍不支持内置 BLE；STM32 使用自定义传输。其 Arduino 编译会跳过 vendored BLE 源码，定义 `AGENT_LINK_DISABLE_BLE` 的编译同样跳过该主机。
 
@@ -42,7 +42,7 @@ ESP32-S2 等没有 BLE 控制器的芯片仍不支持内置 BLE；STM32 使用�
 | 主机任务栈 | 6144 字节 |
 | ATT 首选 MTU | 255 字节，仍需对端协商 |
 
-MSYS2 块为 512 字节数据及 mbuf/协议头留有余量。实际内存还包含主机状态、控制器、任务栈及按需预分配的业务队列；这些数值不是整库总 RAM 占用。CoC 增加代码和 RAM，Wi-Fi/TLS、相机和并行音频也会竞争内部 RAM。大图应分块上传，相机帧和 JPEG 缓冲须按[图片指南](IMAGE-UPLOAD.zh-CN.md)保持有效。
+MSYS2 块为 512 字节数据及 mbuf/协议头留有余量。实际内存还包含主机状态、控制器、任务栈及按需预分配的业务队列；这些数值不是整库总 RAM 占用。CoC 增加代码和 RAM，相机和并行音频也会竞争内部 RAM。大图应分块上传，相机帧和 JPEG 缓冲须按[图片指南](IMAGE-UPLOAD.zh-CN.md)保持有效。
 
 调整配置需要重新编译本库主机源码。仅在 `.ino` 添加宏不能统一配置其他编译单元。修改内部配置时应一起评估通道数、mbuf 池、接收预算和同时运行的业务。固定提交、许可证和本地修改见 [vendor 说明](../src/vendor/nimble-arduino/README.deotaland.md)。
 
@@ -54,7 +54,7 @@ MSYS2 块为 512 字节数据及 mbuf/协议头留有余量。实际内存还包
 
 串口确认 `begin` 成功、IMAGE 支持和相机初始化成功。App 建立当前连接的 IMAGE CoC 后，通过串口、按钮或 `camera0=true` 拍照；App 根据 `0x54` 接收图片，收到 `0x55` 后解码并检查结束状态。断连后的旧图片不能继续发送到新会话。[CoCDiagnostics](../examples/CoCDiagnostics/CoCDiagnostics.ino) 可检查状态和队列，但不能代替 App 的解码和保存结果。
 
-相机板与配套 App 尚未完成实机联调。吞吐、颜色、接收端兼容性、BLE/Wi-Fi 共存与长期稳定性仍须在实际设备上验证，编译通过不能代替收图结果。
+ESP32-S3 AIOT-Basic 已与 Android RoRoLee 3.4.2 完成一次 `camera0` 拍照、JPEG 接收与画面描述，见[硬件记录](HARDWARE-VALIDATION.zh-CN.md)。持续上传、RGB565、其他接收端与长期稳定性仍须分别验证，编译通过不能代替收图结果。
 
 ## 官方依据
 
